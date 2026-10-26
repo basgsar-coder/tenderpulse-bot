@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 TenderPulse GitHub Bounty Scanner
-Searches the GitHub REST API for open issues with attached bounties (Algora, IssueHunt, maintainer tags).
-Extracts bounty values, filters by agent capability, and persists discoveries to SQLite.
+Searches the GitHub REST API for open issues with attached bounties on verified repos.
+Applies strict spam filtering and star thresholds (>=10 stars).
 """
 
 import os
@@ -12,6 +12,7 @@ import json
 import sqlite3
 import urllib.request
 import urllib.error
+import urllib.parse
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
@@ -20,6 +21,16 @@ BASE_DIR = Path(__file__).resolve().parent
 DB_FILE = BASE_DIR / "tenderpulse.db"
 ENV_FILE = BASE_DIR / ".env"
 STATE_FILE = BASE_DIR / "state.json"
+
+# Strict anti-spam repository blocklist
+BLOCKED_REPOS = [
+    "bounty-plaza",
+    "BountyScout",
+    "bounty-alert",
+    "bounty-bot",
+    "airdrop",
+    "faucet"
+]
 
 # Capability filter keywords
 TARGET_KEYWORDS = [
@@ -36,11 +47,9 @@ BOUNTY_REGEXES = [
 ]
 
 def load_github_token() -> Optional[str]:
-    # Check OS environment first
     token = os.environ.get("GITHUB_TOKEN")
     if token and not token.startswith("ghp_YOUR_"):
         return token
-    # Check .env file
     if ENV_FILE.exists():
         for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
             line = line.strip()
@@ -71,6 +80,11 @@ def init_bounty_table():
     conn.commit()
     conn.close()
 
+def is_spam_or_blocked(repo_name: str) -> bool:
+    """Checks if repository matches the spam/aggregator blocklist."""
+    repo_lower = repo_name.lower()
+    return any(blocked.lower() in repo_lower for blocked in BLOCKED_REPOS)
+
 def extract_bounty_amount(text: str) -> float:
     for regex in BOUNTY_REGEXES:
         match = regex.search(text)
@@ -87,7 +101,7 @@ def matches_capabilities(title: str, body: str, labels: List[str]) -> bool:
     combined = f"{title} {body} {' '.join(labels)}".lower()
     return any(kw in combined for kw in TARGET_KEYWORDS)
 
-def search_github_bounties(query: str = "is:issue is:open label:bounty", token: Optional[str] = None) -> List[Dict[str, Any]]:
+def search_github_bounties(query: str = "is:issue is:open label:bounty stars:>=10", token: Optional[str] = None) -> List[Dict[str, Any]]:
     init_bounty_table()
     token = token or load_github_token()
     
@@ -118,13 +132,16 @@ def search_github_bounties(query: str = "is:issue is:open label:bounty", token: 
                 repo_name = "/".join(repo_url.split("/")[-2:]) if repo_url else "unknown"
                 issue_number = item.get("number", 0)
                 
-                # Check capability match
+                # Filter 1: Spam / Aggregator Blocklist
+                if is_spam_or_blocked(repo_name):
+                    continue
+                
+                # Filter 2: Capability Match
                 if not matches_capabilities(title, body, labels):
                     continue
                     
                 bounty_amt = extract_bounty_amount(f"{title} {body}")
                 if bounty_amt == 0.0:
-                    # Default baseline bounty estimate if tagged with bounty label
                     bounty_amt = 25.0
                     
                 candidate = {
@@ -181,7 +198,6 @@ def persist_bounties(bounties: List[Dict[str, Any]]) -> int:
     conn.commit()
     conn.close()
     
-    # Update state.json
     if STATE_FILE.exists():
         try:
             state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
@@ -194,10 +210,10 @@ def persist_bounties(bounties: List[Dict[str, Any]]) -> int:
     return new_count
 
 def run_scanner() -> List[Dict[str, Any]]:
-    print("[BOUNTY_SCANNER] Scanning GitHub for open bounties matching capabilities...")
+    print("[BOUNTY_SCANNER] Scanning GitHub for legitimate bounties (stars:>=10, spam filtered)...")
     queries = [
-        "is:issue is:open label:bounty language:python",
-        "is:issue is:open \"bounty\" in:title language:python"
+        "is:issue is:open label:bounty stars:>=10 language:python",
+        "is:issue is:open \"bounty\" in:title stars:>=10 language:python"
     ]
     all_bounties = []
     seen_ids = set()
@@ -210,7 +226,7 @@ def run_scanner() -> List[Dict[str, Any]]:
                 all_bounties.append(r)
                 
     new_items = persist_bounties(all_bounties)
-    print(f"[BOUNTY_SCANNER] Scan complete. Found {len(all_bounties)} bounties ({new_items} new).")
+    print(f"[BOUNTY_SCANNER] Scan complete. Found {len(all_bounties)} verified bounties ({new_items} new).")
     return all_bounties
 
 if __name__ == "__main__":

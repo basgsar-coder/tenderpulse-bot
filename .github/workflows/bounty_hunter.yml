@@ -31,11 +31,11 @@ jobs:
         run: |
           python -m unittest discover tests/
 
-      - name: Execute Bounty Hunter Cycle
+      - name: Execute Bounty Hunter Cycle (LIVE)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python main.py --dry-run --limit 3
+          python main.py --live --limit 1
 
       - name: Commit State & Patches
         run: |

@@ -51,6 +51,13 @@ class TestBountyScanner(unittest.TestCase):
             "Design vector graphic logo", "Need SVG icon for website", ["design", "art"]
         ))
 
+    def test_spam_filtering(self):
+        self.assertTrue(bounty_scanner.is_spam_or_blocked("zhangjiayang6835-cyber/bounty-plaza"))
+        self.assertTrue(bounty_scanner.is_spam_or_blocked("Rohank143/BountyScout"))
+        self.assertTrue(bounty_scanner.is_spam_or_blocked("some-user/crypto-faucet-bot"))
+        self.assertFalse(bounty_scanner.is_spam_or_blocked("pallets/click"))
+        self.assertFalse(bounty_scanner.is_spam_or_blocked("psf/requests"))
+
     @patch("urllib.request.urlopen")
     def test_search_github_bounties_with_mock_response(self, mock_urlopen):
         mock_response_data = {
