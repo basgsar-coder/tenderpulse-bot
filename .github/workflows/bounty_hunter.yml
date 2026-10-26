@@ -55,14 +55,19 @@ jobs:
         run: |
           git config user.name "TenderPulse-Bot"
           git config user.email "bot@tenderpulse.local"
-          # Fix 18: Exclude tenderpulse.db from git add
           git add state.json patches/ || true
-          if [ -n "$(git status --porcelain)" ]; then
-            git commit -m "chore(telemetry): update bounty hunter state [skip ci]"
-            # Fix 17: Authenticate git push manually
-            git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
-            # Fix 5: Rebase retry loop
-            for i in 1 2 3; do
-              git pull --rebase --autostash && git push && break || sleep 5
-            done
+          
+          if git diff --staged --quiet; then
+            echo "No state changes to commit."
+            exit 0
           fi
+          
+          git commit -m "chore(telemetry): update bounty hunter state [skip ci]"
+          
+          # Retry loop for safe pushing
+          for i in 1 2 3; do
+            git push && exit 0
+            git pull --rebase --autostash || true
+            sleep 5
+          done
+          exit 1

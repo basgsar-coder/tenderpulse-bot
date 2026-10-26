@@ -2,6 +2,7 @@
 .env
 *.key
 state.json.bak
+state.lock
 *.pem
 
 # Token and Account Isolation (Cross-Project Guard)

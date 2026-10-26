@@ -337,7 +337,7 @@ def call_openai_api(api_key: str, prompt: str) -> Tuple[Optional[str], Optional[
 
 def call_gemini_api(api_key: str, prompt: str) -> Tuple[Optional[str], Optional[float]]:
     """Calls Gemini API passing the key in HTTP header, never in query string (Fix 12)."""
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
     headers = {
         "Content-Type": "application/json",
         "x-goog-api-key": api_key
