@@ -34,6 +34,8 @@ jobs:
       - name: Execute Bounty Hunter Cycle (LIVE)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           python main.py --live --limit 1
 
