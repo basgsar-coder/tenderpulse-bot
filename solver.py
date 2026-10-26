@@ -16,6 +16,7 @@ import json
 import re
 import math
 import time
+import socket
 import tempfile
 import subprocess
 import urllib.request
@@ -360,7 +361,7 @@ def call_openai_api(api_key: str, prompt: str) -> Tuple[Optional[str], Optional[
     req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
     for attempt in range(1, 4):
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=60) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 choice = data["choices"][0]
                 # Fix 14: Check finish reason for token truncation
@@ -374,6 +375,14 @@ def call_openai_api(api_key: str, prompt: str) -> Tuple[Optional[str], Optional[
                 comp_tokens = usage.get("completion_tokens", 300)
                 actual_cost = (prompt_tokens * 0.00000015) + (comp_tokens * 0.00000060)
                 return content.strip(), actual_cost
+        except (TimeoutError, socket.timeout) as te:
+            if attempt < 3:
+                wait_time = 5 * attempt
+                print(f"[SOLVER LLM WARNING] OpenAI timeout on attempt {attempt}/3. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+            print(f"[SOLVER LLM ERROR] OpenAI timed out after 3 attempts: {te}")
+            return None, None
         except urllib.error.HTTPError as e:
             if e.code in (503, 429) and attempt < 3:
                 wait_time = 5 * attempt
@@ -386,6 +395,14 @@ def call_openai_api(api_key: str, prompt: str) -> Tuple[Optional[str], Optional[
                 print(f"[SOLVER LLM ERROR] Body: {error_body}")
             except Exception:
                 pass
+            return None, None
+        except urllib.error.URLError as ue:
+            if isinstance(ue.reason, (socket.timeout, TimeoutError)) and attempt < 3:
+                wait_time = 5 * attempt
+                print(f"[SOLVER LLM WARNING] OpenAI socket timeout on attempt {attempt}/3. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+            print(f"[SOLVER LLM ERROR] OpenAI URLError: {ue.reason}")
             return None, None
         except Exception as e:
             print(f"[SOLVER LLM ERROR] OpenAI call failed: {type(e).__name__}")
@@ -419,7 +436,7 @@ def call_gemini_api(api_key: str, prompt: str) -> Tuple[Optional[str], Optional[
     req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
     for attempt in range(1, 4):
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=60) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 candidate = data["candidates"][0]
                 # Fix 14: Check finish reason
@@ -428,6 +445,14 @@ def call_gemini_api(api_key: str, prompt: str) -> Tuple[Optional[str], Optional[
                     return None, None
                 content = candidate["content"]["parts"][0]["text"]
                 return content.strip(), AVG_CALL_COST_USD
+        except (TimeoutError, socket.timeout) as te:
+            if attempt < 3:
+                wait_time = 5 * attempt
+                print(f"[SOLVER LLM WARNING] Gemini timeout on attempt {attempt}/3. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+            print(f"[SOLVER LLM ERROR] Gemini timed out after 3 attempts: {te}")
+            return None, None
         except urllib.error.HTTPError as e:
             if e.code in (503, 429) and attempt < 3:
                 wait_time = 5 * attempt
@@ -440,6 +465,14 @@ def call_gemini_api(api_key: str, prompt: str) -> Tuple[Optional[str], Optional[
                 print(f"[SOLVER LLM ERROR] Body: {error_body}")
             except Exception:
                 pass
+            return None, None
+        except urllib.error.URLError as ue:
+            if isinstance(ue.reason, (socket.timeout, TimeoutError)) and attempt < 3:
+                wait_time = 5 * attempt
+                print(f"[SOLVER LLM WARNING] Gemini socket timeout on attempt {attempt}/3. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+            print(f"[SOLVER LLM ERROR] Gemini URLError: {ue.reason}")
             return None, None
         except Exception as e:
             print(f"[SOLVER LLM ERROR] Gemini call failed: {type(e).__name__}")
