@@ -100,6 +100,20 @@ class TestVerifiedBountyScanner(unittest.TestCase):
             bounty_scanner.search_github_bounties("test query", token="test_token")
 
     @patch("urllib.request.urlopen")
+    def test_rate_limit_raises(self, mock_urlopen):
+        """Exact test from Audit Fix 22: Mock HTTPError 403 with X-RateLimit-Remaining: 0."""
+        headers = {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1730000000"}
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            url="https://api.github.com/search/issues",
+            code=403,
+            msg="rate limit exceeded",
+            hdrs=headers,
+            fp=None
+        )
+        with self.assertRaises(bounty_scanner.RateLimited):
+            bounty_scanner.github_json("https://api.github.com/search/issues", "token")
+
+    @patch("urllib.request.urlopen")
     def test_search_github_bounties_filters_unverified(self, mock_urlopen):
         mock_response = {
             "total_count": 2,

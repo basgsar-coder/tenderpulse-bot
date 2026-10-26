@@ -26,7 +26,8 @@ class TestBudgetGuardAndPatchValidation(unittest.TestCase):
         self.orig_state_file = solver.STATE_FILE
         self.orig_lock_file = solver.STATE_LOCK_FILE
         
-        solver.STATE_FILE = self.temp_dir_path / "state.json"
+        self.temp_state_file = self.temp_dir_path / "state.json"
+        solver.STATE_FILE = self.temp_state_file
         solver.STATE_LOCK_FILE = self.temp_dir_path / "state.lock"
 
         # Initialize valid state
@@ -38,7 +39,19 @@ class TestBudgetGuardAndPatchValidation(unittest.TestCase):
             "processed_issue_ids": [],
             "recent_submissions": []
         }
-        solver.STATE_FILE.write_text(json.dumps(initial_state), encoding="utf-8")
+        self.temp_state_file.write_text(json.dumps(initial_state), encoding="utf-8")
+
+        # Set up git repo for patch validation tests
+        self.repo_path = self.temp_dir_path / "test_repo"
+        self.repo_path.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init"], cwd=str(self.repo_path), capture_output=True, check=True)
+        sample_file = self.repo_path / "sample.py"
+        sample_file.write_text("def f():\n    return 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "sample.py"], cwd=str(self.repo_path), capture_output=True, check=True)
+        subprocess.run(
+            ["git", "-c", "user.name=Test", "-c", "user.email=test@test.local", "commit", "-m", "init"],
+            cwd=str(self.repo_path), capture_output=True, check=True
+        )
 
     def tearDown(self):
         solver.STATE_FILE = self.orig_state_file
@@ -70,46 +83,75 @@ class TestBudgetGuardAndPatchValidation(unittest.TestCase):
         with self.assertRaises(solver.StateError):
             solver.reserve_budget(0.005)
 
+    def test_corrupt_state_fails_closed(self):
+        """Exact test from Audit Fix 22: corrupt state.json raises StateError fail-closed."""
+        self.temp_state_file.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(solver.StateError):
+            solver.load_state()
+
     def test_file_locking_context_manager(self):
         """Verifies that file_lock acquires and releases the lock file cleanly."""
         lock_path = self.temp_dir_path / "test.lock"
         with solver.file_lock(lock_path):
             self.assertTrue(lock_path.exists())
 
+    def test_extract_rejects_prose_without_diff(self):
+        """Exact test from Audit Fix 22: prose without diff raises ValueError."""
+        with self.assertRaises(ValueError):
+            solver.extract_unified_diff("Here is a long explanation.", "app.py")
+
+    def test_extract_rejects_multiple_files(self):
+        """Exact test from Audit Fix 22: diff touching multiple files raises ValueError."""
+        raw = (
+            "--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-x\n+y\n"
+            "--- a/.github/workflows/ci.yml\n+++ b/.github/workflows/ci.yml\n"
+            "@@ -1 +1 @@\n-a\n+b\n"
+        )
+        with self.assertRaises(ValueError):
+            solver.extract_unified_diff(raw, "app.py")
+
+    def test_invalid_patch_fails_git_apply_check(self):
+        """Exact test from Audit Fix 22: invalid synthetic patch fails git apply --check."""
+        patch = solver.synthesize_semantic_code_fix(
+            "sample.py", 'def f():\n    return 1\n', {"issue_number": 1, "title": "x"}
+        )
+        ok, _ = solver.validate_patch(patch, "sample.py", self.repo_path)
+        self.assertFalse(ok)
+
+    def test_valid_issue_boundary_checks(self):
+        """Audit Fix 19: Boundary validation for issue fields."""
+        self.assertTrue(solver.valid_issue({
+            "repo": "owner/repo",
+            "issue_number": 12,
+            "id": "123456",
+            "bounty_amount": 50.0
+        }))
+        self.assertFalse(solver.valid_issue({"repo": "bad repo", "issue_number": 1, "id": "1", "bounty_amount": 10}))
+        self.assertFalse(solver.valid_issue({"repo": "a/b", "issue_number": -1, "id": "1", "bounty_amount": 10}))
+        self.assertFalse(solver.valid_issue({"repo": "a/b", "issue_number": 1, "id": "None", "bounty_amount": 10}))
+        self.assertFalse(solver.valid_issue({"repo": "a/b", "issue_number": 1, "id": "1", "bounty_amount": 0}))
+
     def test_git_apply_rejects_malformed_patch(self):
         """Proves that validate_patch rejects a malformed or invalid patch via git apply --check."""
-        repo_dir = self.temp_dir_path / "test_repo"
-        repo_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Initialize a real git repo
-        subprocess.run(["git", "init"], cwd=str(repo_dir), capture_output=True, check=True)
-        target_file = repo_dir / "example.py"
-        target_file.write_text("def hello():\n    return 'world'\n", encoding="utf-8")
-        subprocess.run(["git", "add", "example.py"], cwd=str(repo_dir), capture_output=True, check=True)
-        subprocess.run(
-            ["git", "-c", "user.name=Test", "-c", "user.email=test@test.local", "commit", "-m", "init"],
-            cwd=str(repo_dir), capture_output=True, check=True
-        )
-
         # 1. Test malformed patch syntax (garbage lines)
-        malformed_patch = """--- a/example.py
-+++ b/example.py
+        malformed_patch = """--- a/sample.py
++++ b/sample.py
 @@ -1,2 +1,2 @@
--def hello():
+-def f():
 +invalid hunk without context and wrong headers
 """
-        valid = solver.validate_patch(repo_dir, malformed_patch)
+        valid = solver.validate_patch(self.repo_path, malformed_patch)
         self.assertFalse(valid, "validate_patch MUST reject malformed patch headers")
 
         # 2. Test valid unified diff patch that matches repository content
-        valid_patch = """--- a/example.py
-+++ b/example.py
+        valid_patch = """--- a/sample.py
++++ b/sample.py
 @@ -1,2 +1,3 @@
- def hello():
+ def f():
 +    print('greeting')
-     return 'world'
+     return 1
 """
-        valid_res = solver.validate_patch(repo_dir, valid_patch)
+        valid_res = solver.validate_patch(self.repo_path, valid_patch)
         self.assertTrue(valid_res, "validate_patch MUST accept valid unified diff matching repo lines")
 
 if __name__ == "__main__":

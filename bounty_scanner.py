@@ -145,13 +145,11 @@ def detect_platform(text: str) -> Optional[Tuple[str, float, str]]:
 
     return None
 
-def search_github_bounties(query: str = "is:issue is:open label:bounty stars:>=10", token: Optional[str] = None) -> List[Dict[str, Any]]:
-    init_bounty_table()
-    token = token or load_auth_token()
-    
-    encoded_query = urllib.parse.quote(query)
-    url = f"https://api.github.com/search/issues?q={encoded_query}&sort=updated&order=desc&per_page=30"
-    
+def github_json(url: str, token: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Executes GET request to GitHub API, checking rate limit headers and raising
+    RateLimited on HTTP 403/429 or when X-RateLimit-Remaining == 0 (Fix 8, 22).
+    """
     headers = {
         "User-Agent": "TenderPulse-BountyHunter/2.0",
         "Accept": "application/vnd.github.v3+json"
@@ -160,69 +158,81 @@ def search_github_bounties(query: str = "is:issue is:open label:bounty stars:>=1
         headers["Authorization"] = f"token {token}"
         
     req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            remaining = resp.headers.get("X-RateLimit-Remaining")
+            if remaining is not None and int(remaining) == 0:
+                reset_time = int(resp.headers.get("X-RateLimit-Reset", 0)) if resp.headers.get("X-RateLimit-Reset") else None
+                raise RateLimited("GitHub Search API rate limit exhausted (X-RateLimit-Remaining=0)", reset_time=reset_time)
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code in (403, 429):
+            reset_time = int(e.headers.get("X-RateLimit-Reset", 0)) if e.headers.get("X-RateLimit-Reset") else None
+            retry_after = int(e.headers.get("Retry-After", 0)) if e.headers.get("Retry-After") else None
+            raise RateLimited(f"GitHub API returned HTTP {e.code} ({e.reason})", reset_time=reset_time, retry_after=retry_after) from e
+        raise
+
+def search_github_bounties(query: str = "is:issue is:open label:bounty stars:>=10", token: Optional[str] = None) -> List[Dict[str, Any]]:
+    init_bounty_table()
+    token = token or load_auth_token()
+    
+    encoded_query = urllib.parse.quote(query)
+    url = f"https://api.github.com/search/issues?q={encoded_query}&sort=updated&order=desc&per_page=30"
     candidates = []
     
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            # Check rate limit headers (Fix 8)
-            remaining = resp.headers.get("X-RateLimit-Remaining")
-            if remaining is not None and int(remaining) == 0:
-                reset_time = int(resp.headers.get("X-RateLimit-Reset", 0))
-                raise RateLimited("GitHub Search API rate limit exhausted (X-RateLimit-Remaining=0)", reset_time=reset_time)
-                
-            data = json.loads(resp.read().decode("utf-8"))
-            items = data.get("items", [])
+        data = github_json(url, token)
+        items = data.get("items", [])
             
-            comment_checks = 0
-            for item in items:
-                title = item.get("title", "")
-                body = item.get("body") or ""
-                labels = [l.get("name", "") for l in item.get("labels", [])]
-                html_url = item.get("html_url", "")
-                issue_id = str(item.get("id"))
-                repo_url = item.get("repository_url", "")
-                repo_name = "/".join(repo_url.split("/")[-2:]) if repo_url else "unknown"
-                issue_number = item.get("number", 0)
+        comment_checks = 0
+        for item in items:
+            title = item.get("title", "")
+            body = item.get("body") or ""
+            labels = [l.get("name", "") for l in item.get("labels", [])]
+            html_url = item.get("html_url", "")
+            issue_id = str(item.get("id"))
+            repo_url = item.get("repository_url", "")
+            repo_name = "/".join(repo_url.split("/")[-2:]) if repo_url else "unknown"
+            issue_number = item.get("number", 0)
+            
+            # Filter 1: Spam check
+            if is_spam_repo(repo_name):
+                continue
                 
-                # Filter 1: Spam check
-                if is_spam_repo(repo_name):
-                    continue
-                    
-                # Filter 2: Verified Payout Platform check (Fix 6)
-                platform_info = detect_platform(f"{title}\n{body}")
-                if not platform_info and item.get("comments", 0) > 0 and comment_checks < 6:
-                    comment_checks += 1
-                    try:
-                        comments_url = f"https://api.github.com/repos/{repo_name}/issues/{issue_number}/comments?per_page=5"
-                        c_req = urllib.request.Request(comments_url, headers=headers)
-                        with urllib.request.urlopen(c_req, timeout=5) as c_resp:
-                            c_items = json.loads(c_resp.read().decode("utf-8"))
-                            c_text = "\n".join(c.get("body", "") for c in c_items)
-                            platform_info = detect_platform(f"{title}\n{body}\n{c_text}")
-                    except Exception:
-                        pass
+            # Filter 2: Verified Payout Platform check (Fix 6)
+            platform_info = detect_platform(f"{title}\n{body}")
+            if not platform_info and item.get("comments", 0) > 0 and comment_checks < 6:
+                comment_checks += 1
+                try:
+                    comments_url = f"https://api.github.com/repos/{repo_name}/issues/{issue_number}/comments?per_page=5"
+                    c_items = github_json(comments_url, token)
+                    if isinstance(c_items, list):
+                        c_text = "\n".join(c.get("body", "") for c in c_items)
+                        platform_info = detect_platform(f"{title}\n{body}\n{c_text}")
+                except Exception:
+                    pass
 
-                if not platform_info:
-                    # Skip unverified bounty claims with no recognized escrow platform
-                    continue
-                    
-                platform_name, bounty_amt, claim_url = platform_info
+            if not platform_info:
+                # Skip unverified bounty claims with no recognized escrow platform
+                continue
                 
-                candidate = {
-                    "id": issue_id,
-                    "repo": repo_name,
-                    "issue_number": issue_number,
-                    "title": title,
-                    "url": html_url,
-                    "bounty_amount": bounty_amt,
-                    "currency": "USD",
-                    "platform": platform_name,
-                    "claim_url": claim_url,
-                    "labels": ", ".join(labels),
-                    "body_preview": body[:300].replace("\r", " ").replace("\n", " "),
-                    "full_body": body
-                }
-                candidates.append(candidate)
+            platform_name, bounty_amt, claim_url = platform_info
+            
+            candidate = {
+                "id": issue_id,
+                "repo": repo_name,
+                "issue_number": issue_number,
+                "title": title,
+                "url": html_url,
+                "bounty_amount": bounty_amt,
+                "currency": "USD",
+                "platform": platform_name,
+                "claim_url": claim_url,
+                "labels": ", ".join(labels),
+                "body_preview": body[:300].replace("\r", " ").replace("\n", " "),
+                "full_body": body
+            }
+            candidates.append(candidate)
                 
     except urllib.error.HTTPError as e:
         if e.code in (403, 429):

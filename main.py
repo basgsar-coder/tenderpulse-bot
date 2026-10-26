@@ -32,7 +32,7 @@ if sys.stdout and hasattr(sys.stdout, "reconfigure"):
         pass
 
 from bounty_scanner import run_scanner, load_auth_token, RateLimited, DB_FILE
-from solver import solve_issue, load_state, save_state, file_lock, STATE_LOCK_FILE, StateError
+from solver import solve_issue, load_state, save_state, file_lock, STATE_LOCK_FILE, StateError, valid_issue
 
 MAX_SUBMISSIONS_PER_DAY = 3
 MIN_SECONDS_BETWEEN_SAME_REPO = 7 * 86400  # 7 days cooldown
@@ -183,7 +183,7 @@ def main():
     parser = argparse.ArgumentParser(description="TenderPulse Autonomous GitHub Bounty Hunter")
     parser.add_argument("--live", action="store_true", help="Submit live PRs/comments to GitHub (requires BOUNTY_BOT_TOKEN)")
     parser.add_argument("--dry-run", action="store_true", default=True, help="Run without posting or updating state (default)")
-    parser.add_argument("--limit", type=int, default=1, help="Max bounties to attempt solving per cycle")
+    parser.add_argument("--limit", type=int, default=1, choices=range(1, 4), help="Max bounties to attempt solving per cycle (1-3)")
     args = parser.parse_args()
 
     if args.live:
@@ -219,9 +219,10 @@ def main():
         print("[MAIN] No verified, open bounties found matching criteria.")
         return 0
 
-    # Sort bounties by amount descending
+    # Sort bounties by amount descending and validate boundaries (Fix 19)
     sorted_bounties = sorted(bounties, key=lambda x: x.get("bounty_amount", 0.0), reverse=True)
-    candidates = sorted_bounties[:args.limit]
+    valid_candidates = [b for b in sorted_bounties if valid_issue(b)]
+    candidates = valid_candidates[:args.limit]
 
     solved_count = 0
     for issue in candidates:

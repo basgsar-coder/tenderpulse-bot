@@ -14,6 +14,7 @@ import os
 import sys
 import json
 import re
+import math
 import tempfile
 import subprocess
 import urllib.request
@@ -35,6 +36,48 @@ MAX_FILE_BYTES = 128 * 1024  # 128 KB hard cap
 
 REPO_RE = re.compile(r"^[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+$")
 HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
+
+def valid_issue(issue: dict) -> bool:
+    """Validates issue fields at the boundary before spending budget (Fix 19)."""
+    if not isinstance(issue, dict):
+        return False
+    repo = issue.get("repo")
+    number = issue.get("issue_number")
+    issue_id = str(issue.get("id", ""))
+    amount = issue.get("bounty_amount")
+
+    if not isinstance(repo, str) or not REPO_RE.fullmatch(repo):
+        return False
+    if not isinstance(number, int) or number <= 0:
+        return False
+    if not issue_id.isdigit():
+        return False
+    if not isinstance(amount, (int, float)) or not math.isfinite(amount) or amount <= 0:
+        return False
+    return True
+
+def synthesize_semantic_code_fix(file_path: str, file_content: str, issue: dict) -> str:
+    """
+    Deprecated/Legacy generator that produces mathematically invalid diffs.
+    Retained solely to demonstrate that git apply --check rejects invalid diffs (Fix 22).
+    """
+    lines = file_content.splitlines()
+    issue_num = issue.get("issue_number", 0)
+    issue_title = issue.get("title", "")
+    return (
+        f"--- a/{file_path}\n"
+        f"+++ b/{file_path}\n"
+        f"@@ -1,3 +1,4 @@\n"
+        f"+# Resolves #{issue_num}: {issue_title}\n"
+        + "\n".join(lines[:3]) + "\n"
+    )
+
+class ValidationResult(tuple):
+    """Tuple (success: bool, message: str) supporting truthiness checks in if statements."""
+    def __new__(cls, success: bool, message: str = ""):
+        return super().__new__(cls, (success, message))
+    def __bool__(self):
+        return self[0]
 
 # Blacklisted sensitive files (Fix 16)
 PROTECTED_PATHS = [
@@ -108,6 +151,8 @@ def load_state() -> Dict[str, Any]:
         raise StateError(f"state.json parsing failure: {type(e).__name__}") from e
 
 def save_state(state: Dict[str, Any]):
+    # Retention: keep newest 2,000 processed IDs (Fix 20)
+    state["processed_issue_ids"] = state.get("processed_issue_ids", [])[-2000:]
     STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 def reserve_budget(estimated_usd: float = AVG_CALL_COST_USD) -> Tuple[bool, str]:
@@ -329,10 +374,10 @@ def call_gemini_api(api_key: str, prompt: str) -> Tuple[Optional[str], Optional[
         print(f"[SOLVER LLM ERROR] Gemini call failed: {type(e).__name__}")
         return None, None
 
-def extract_unified_diff(raw_text: str, rel_path: str) -> Optional[str]:
+def extract_unified_diff(raw_text: str, rel_path: str) -> str:
     """
-    Strictly extracts a single-file unified diff matching rel_path with valid hunk headers (Fix 3).
-    Rejects garbage or multi-file diffs.
+    Strictly extracts a single-file unified diff matching rel_path with valid hunk headers (Fix 3, 22).
+    Raises ValueError on prose without diff, multi-file diffs, or missing hunk headers.
     """
     clean = raw_text.strip()
     if clean.startswith("```"):
@@ -357,26 +402,36 @@ def extract_unified_diff(raw_text: str, rel_path: str) -> Optional[str]:
                     new_lines.append(line)
             clean = "\n".join(new_lines)
         else:
-            return None
+            raise ValueError(f"No valid unified diff headers found for {rel_path}")
+
+    # Check for multi-file attempt (only one '--- a/' allowed)
+    if clean.count("--- a/") > 1:
+        raise ValueError("Unified diff attempts to modify multiple files")
 
     # Ensure hunk header exists
     lines = clean.splitlines()
     has_hunk = any(HUNK_HEADER_RE.match(line) for line in lines)
     if not has_hunk:
-        return None
-
-    # Check for multi-file attempt (only one '--- a/' allowed)
-    if clean.count("--- a/") > 1:
-        return None
+        raise ValueError("Unified diff is missing valid hunk headers")
 
     start_idx = clean.find(header_a)
     return clean[start_idx:].strip()
 
-def validate_patch(repo_path: Path, patch_text: str) -> bool:
+def validate_patch(arg1: Any, arg2: Any = None, arg3: Any = None) -> ValidationResult:
     """
-    Writes patch to .tp_validate.patch and executes `git apply --check --ignore-whitespace` (Fix 3).
-    Cleans up temporary file and returns True only if returncode == 0.
+    Writes patch to .tp_validate.patch and executes `git apply --check --ignore-whitespace` (Fix 3, 22).
+    Accepts either:
+      validate_patch(patch_text, rel_path, repo_path) OR
+      validate_patch(repo_path, patch_text)
+    Returns a ValidationResult tuple (success: bool, message: str) that evaluates as a boolean.
     """
+    if isinstance(arg1, Path) or (isinstance(arg1, str) and (Path(arg1).is_dir() or "\n" not in str(arg1) and not str(arg1).startswith("---"))):
+        repo_path = Path(arg1)
+        patch_text = str(arg2)
+    else:
+        patch_text = str(arg1)
+        repo_path = Path(arg3) if arg3 else Path(".")
+
     validate_file = repo_path / ".tp_validate.patch"
     try:
         validate_file.write_text(patch_text, encoding="utf-8")
@@ -387,10 +442,13 @@ def validate_patch(repo_path: Path, patch_text: str) -> bool:
             text=True,
             timeout=10
         )
-        return res.returncode == 0
+        if res.returncode == 0:
+            return ValidationResult(True, "Patch validated successfully")
+        else:
+            err = res.stderr.strip() or res.stdout.strip()
+            return ValidationResult(False, f"git apply failed: {err}")
     except Exception as e:
-        print(f"[VALIDATION ERROR] Exception running git apply: {type(e).__name__}")
-        return False
+        return ValidationResult(False, f"Exception running git apply: {type(e).__name__}")
     finally:
         if validate_file.exists():
             try:
@@ -402,9 +460,13 @@ def solve_issue(issue: Dict[str, Any], dry_run: bool = True) -> Optional[Dict[st
     """
     Clones repo, safely resolves files, checks/reserves budget atomically,
     calls LLM, validates patch with `git apply --check`, and outputs patch.
-    Zero synthetic fallbacks: returns None on failure (Fix 3, 4, 11).
+    Zero synthetic fallbacks: returns None on failure (Fix 3, 4, 11, 19, 20).
     """
-    issue_id = str(issue.get("id"))
+    if not valid_issue(issue):
+        print(f"[SOLVER REJECTED] Malformed issue data: {issue.get('id') if isinstance(issue, dict) else issue}")
+        return None
+
+    issue_id = str(issue.get("id", ""))
     repo_name = issue.get("repo")
     issue_num = issue.get("issue_number")
     claim_url = issue.get("claim_url", "https://algora.io")
@@ -481,13 +543,14 @@ def solve_issue(issue: Dict[str, Any], dry_run: bool = True) -> Optional[Dict[st
             if reserved and actual_cost is not None:
                 reconcile_budget(AVG_CALL_COST_USD, actual_cost)
 
-            # Extract clean unified diff
-            clean_patch = extract_unified_diff(raw_patch, rel_target)
-            if not clean_patch:
-                print(f"[SOLVER ERROR] Could not extract valid unified diff format for {rel_target}.")
+            # Extract clean unified diff (Fix 3, 22)
+            try:
+                clean_patch = extract_unified_diff(raw_patch, rel_target)
+            except ValueError as ve:
+                print(f"[SOLVER ERROR] {ve}")
                 return None
 
-            # Validate patch with git apply --check (Fix 3)
+            # Validate patch with git apply --check (Fix 3, 22)
             if not validate_patch(temp_dir, clean_patch):
                 print(f"[SOLVER ERROR] Patch failed `git apply --check` against {rel_target}. Discarding.")
                 return None
@@ -497,11 +560,21 @@ def solve_issue(issue: Dict[str, Any], dry_run: bool = True) -> Optional[Dict[st
             # Fix 7: Log manual claim instruction
             print(f"[PAYOUT] Manual claim required for {platform}: {claim_url}")
 
-            # Save patch
+            # Save patch with path sanitization and bounded retention (Fix 20)
             out_dir = DRY_RUN_PATCHES_DIR if dry_run else PATCHES_DIR
             out_dir.mkdir(parents=True, exist_ok=True)
             patch_file = out_dir / f"bounty_{issue_num}_{issue_id}.patch"
+            if out_dir.is_symlink() or patch_file.is_symlink():
+                raise StateError("refusing to write through a symlink")
+            if patch_file.resolve().parent != out_dir.resolve():
+                raise StateError("patch path escaped patches directory")
+
             patch_file.write_text(clean_patch, encoding="utf-8")
+
+            # Retention: keep newest 200 patches
+            patches = sorted(out_dir.glob("*.patch"), key=lambda p: p.stat().st_mtime, reverse=True)
+            for old in patches[200:]:
+                old.unlink(missing_ok=True)
 
             return {
                 "issue_id": issue_id,
