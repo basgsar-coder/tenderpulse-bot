@@ -256,11 +256,24 @@ def safe_target(repo_path: Path, candidate: Path) -> Optional[Path]:
 
     return candidate
 
+def ext_priority(path_str: str) -> int:
+    lower = path_str.lower()
+    if lower.endswith((".py", ".js", ".ts", ".go", ".rs", ".jsx", ".tsx", ".c", ".cpp", ".h")):
+        return 0
+    if lower.endswith((".json", ".yml", ".yaml")):
+        return 1
+    return 2  # .md or documentation
+
 def find_candidate_files(repo_path: Path, issue_title: str, issue_body: str) -> List[Path]:
-    """Locates and validates candidate source files referenced in issue context."""
+    """
+    Locates and validates candidate source files referenced in issue context.
+    Prioritizes source code extensions (.py, .js, .ts, .go, .rs) over documentation (.md).
+    If code files exist, never falls back to readme.md.
+    """
     found = []
     combined = f"{issue_title} {issue_body}"
-    patterns = re.findall(r"[\w\-\/\\]+\.(?:py|md|js|ts|json|yml|yaml)\b", combined)
+    patterns = re.findall(r"[\w\-\/\\]+\.(?:py|js|ts|go|rs|jsx|tsx|c|cpp|h|json|yml|yaml|md)\b", combined)
+    patterns = sorted(patterns, key=ext_priority)
     
     for pat in patterns:
         clean_pat = pat.replace("\\", "/").lstrip("/")
@@ -277,20 +290,48 @@ def find_candidate_files(repo_path: Path, issue_title: str, issue_body: str) -> 
                     if safe and safe not in found:
                         found.append(safe)
 
-    # Fallback to general python/markdown source files
-    if not found:
-        for ext in ["*.py", "*.md"]:
+    found.sort(key=lambda p: ext_priority(p.name))
+
+    # Check if any source code file was found
+    has_code = any(p.suffix.lower() in [".py", ".js", ".ts", ".go", ".rs", ".jsx", ".tsx", ".c", ".cpp", ".h"] for p in found)
+    
+    # If no source code was found from the issue text, prioritize searching the repo for code
+    if not has_code:
+        code_exts = ["*.py", "*.js", "*.ts", "*.go", "*.rs", "*.jsx", "*.tsx"]
+        code_files = []
+        for ext in code_exts:
             for f in repo_path.glob(f"**/{ext}"):
+                if ".git" not in f.parts and f.is_file():
+                    safe = safe_target(repo_path, f)
+                    if safe and safe not in code_files:
+                        code_files.append(safe)
+                        if len(code_files) >= 2:
+                            break
+            if code_files:
+                break
+                
+        if code_files:
+            return code_files[:2]
+
+        # Only if zero source code files exist in repository, fallback to markdown
+        if not found:
+            for f in repo_path.glob("**/*.md"):
                 if ".git" not in f.parts and f.is_file():
                     safe = safe_target(repo_path, f)
                     if safe and safe not in found:
                         found.append(safe)
                         if len(found) >= 2:
                             break
-            if found:
-                break
-                
+
+    # If code files were found, filter out documentation files (.md)
+    code_only = [p for p in found if p.suffix.lower() != ".md"]
+    if code_only:
+        return code_only[:2]
+
     return found[:2]
+
+# Alias for compatibility
+find_relevant_files = find_candidate_files
 
 def call_openai_api(api_key: str, prompt: str) -> Tuple[Optional[str], Optional[float]]:
     url = "https://api.openai.com/v1/chat/completions"
@@ -370,6 +411,14 @@ def call_gemini_api(api_key: str, prompt: str) -> Tuple[Optional[str], Optional[
                 return None, None
             content = candidate["content"]["parts"][0]["text"]
             return content.strip(), AVG_CALL_COST_USD
+    except urllib.error.HTTPError as e:
+        print(f"[SOLVER LLM ERROR] Gemini HTTP {e.code}")
+        try:
+            error_body = e.read().decode('utf-8')
+            print(f"[SOLVER LLM ERROR] Body: {error_body}")
+        except Exception:
+            pass
+        return None, None
     except Exception as e:
         print(f"[SOLVER LLM ERROR] Gemini call failed: {type(e).__name__}")
         return None, None
