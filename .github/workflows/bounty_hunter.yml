@@ -4,44 +4,66 @@ on:
   schedule:
     # Runs every 6 hours (00:00, 06:00, 12:00, 18:00 UTC)
     - cron: '0 */6 * * *'
-  workflow_dispatch: # Allows manual trigger from GitHub UI
+  workflow_dispatch:
+
+# Fix 5: Concurrency group prevents overlapping runner collisions
+concurrency:
+  group: tenderpulse-bounty-hunter-${{ github.repository }}
+  cancel-in-progress: false
 
 jobs:
   hunt-bounties:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Fix 17: Least privilege (only contents: write for state commits)
     permissions:
       contents: write
-      issues: write
-      pull-requests: write
 
     steps:
+      # Fix 17: Pin full commit SHA and disable credential persistence
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          persist-credentials: false
 
+      # Fix 17: Pin full commit SHA
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@0a5c61591373683505ea898e09a6ea1c8119ae97 # v5.0.0
         with:
           python-version: '3.12'
 
-      - name: Verify Pre-commit Guards
+      - name: Verify Secret Guard
         run: |
           python scripts/secret_guard.py
 
-      - name: Run Unit Tests
+      - name: Run Test Suite
         run: |
           python -m unittest discover tests/
 
+      # Fix 1: Pass BOUNTY_BOT_TOKEN for external PR submissions
+      # Fix 12: Pass GEMINI_API_KEY / OPENAI_API_KEY
       - name: Execute Bounty Hunter Cycle (LIVE)
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BOUNTY_BOT_TOKEN: ${{ secrets.BOUNTY_BOT_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           python main.py --live --limit 1
 
+      # Fix 5 & 18: Always commit state/patches, exclude DB, rebase retry loop
       - name: Commit State & Patches
+        if: always()
         run: |
           git config user.name "TenderPulse-Bot"
           git config user.email "bot@tenderpulse.local"
-          git add state.json patches/ tenderpulse.db || true
-          git diff --quiet && git diff --staged --quiet || (git commit -m "chore(telemetry): update bounty hunter state [skip ci]" && git push)
+          # Fix 18: Exclude tenderpulse.db from git add
+          git add state.json patches/ || true
+          if [ -n "$(git status --porcelain)" ]; then
+            git commit -m "chore(telemetry): update bounty hunter state [skip ci]"
+            # Fix 17: Authenticate git push manually
+            git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+            # Fix 5: Rebase retry loop
+            for i in 1 2 3; do
+              git pull --rebase --autostash && git push && break || sleep 5
+            done
+          fi

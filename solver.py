@@ -1,31 +1,83 @@
 #!/usr/bin/env python3
 """
 TenderPulse Contextual LLM Solver & Budget Guard Engine
-Downloads the target GitHub repository, reads the referenced source files,
-constructs a prompt with issue context and file content, calls the LLM API
-(OpenAI / Gemini) within strict $5.00 monthly budget limits, and outputs
-real unified diff code patches.
+- Clones target repositories with safe naming and shallow flags.
+- Rejects symlinks and enforces 128KB file size caps.
+- Blacklists sensitive security files (.github/workflows, lockfiles, etc.).
+- Enforces atomic file-locked budget reservation ($5.00 cap) with fail-closed StateError.
+- Calls OpenAI or Gemini with sanitized headers (no key in query string).
+- Validates patches with `git apply --check` before returning.
+- Zero fake fallbacks: if LLM fails, returns None.
 """
 
 import os
 import sys
 import json
 import re
-import shutil
 import tempfile
 import subprocess
 import urllib.request
 import urllib.error
 from pathlib import Path
+from contextlib import contextmanager
 from typing import Dict, Any, Optional, Tuple, List
 
 BASE_DIR = Path(__file__).resolve().parent
 STATE_FILE = BASE_DIR / "state.json"
+STATE_LOCK_FILE = BASE_DIR / "state.lock"
 PATCHES_DIR = BASE_DIR / "patches"
+DRY_RUN_PATCHES_DIR = BASE_DIR / "dry_run_patches"
 ENV_FILE = BASE_DIR / ".env"
 
-DEFAULT_BUDGET_CAP = 5.00  # Strict $5.00 USD monthly limit
-AVG_CALL_COST_USD = 0.005  # Estimated cost per issue analysis (~$0.005 for gpt-4o-mini)
+DEFAULT_BUDGET_CAP = 5.00
+AVG_CALL_COST_USD = 0.005
+MAX_FILE_BYTES = 128 * 1024  # 128 KB hard cap
+
+REPO_RE = re.compile(r"^[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+$")
+HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
+
+# Blacklisted sensitive files (Fix 16)
+PROTECTED_PATHS = [
+    ".github/workflows",
+    "package.json",
+    "package-lock.json",
+    "yarn.lock",
+    "poetry.lock",
+    "Pipfile.lock",
+    "Cargo.lock",
+    "setup.py",
+    "pyproject.toml",
+    "Dockerfile",
+    "docker-compose.yml"
+]
+
+class StateError(Exception):
+    """Raised when state.json is missing, unparseable, or invalid (Fail-Closed)."""
+    pass
+
+@contextmanager
+def file_lock(lock_path: Path):
+    """Cross-platform advisory file lock for atomic budget state management (Fix 4)."""
+    lock_file = open(lock_path, "w")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        lock_file.close()
 
 def load_env_keys() -> Dict[str, str]:
     keys = {}
@@ -35,112 +87,167 @@ def load_env_keys() -> Dict[str, str]:
             if line and not line.startswith("#") and "=" in line:
                 k, v = line.split("=", 1)
                 keys[k.strip()] = v.strip().strip('"').strip("'")
-    # Environment variables override
-    for k in ["OPENAI_API_KEY", "GEMINI_API_KEY", "DEEPSEEK_API_KEY"]:
-        if os.environ.get(k):
-            keys[k] = os.environ[k]
+    for k in ["OPENAI_API_KEY", "GEMINI_API_KEY", "BOUNTY_BOT_TOKEN", "GITHUB_TOKEN"]:
+        val = os.environ.get(k)
+        if val:
+            keys[k] = val
     return keys
 
 def load_state() -> Dict[str, Any]:
+    """Loads state.json fail-closed. If corrupt, raises StateError (Fix 4)."""
     if not STATE_FILE.exists():
-        default_state = {
-            "llm_spend_this_month": 0.0,
-            "monthly_budget_cap": DEFAULT_BUDGET_CAP,
-            "bounties_discovered": 0,
-            "bounties_solved": 0,
-            "processed_issue_ids": []
-        }
-        STATE_FILE.write_text(json.dumps(default_state, indent=2), encoding="utf-8")
-        return default_state
+        raise StateError(f"state.json does not exist at {STATE_FILE}. Fail-closed.")
     try:
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {
-            "llm_spend_this_month": 0.0,
-            "monthly_budget_cap": DEFAULT_BUDGET_CAP,
-            "bounties_discovered": 0,
-            "bounties_solved": 0,
-            "processed_issue_ids": []
-        }
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or "llm_spend_this_month" not in data:
+            raise StateError("state.json is malformed or missing required keys.")
+        return data
+    except Exception as e:
+        if isinstance(e, StateError):
+            raise
+        raise StateError(f"state.json parsing failure: {type(e).__name__}") from e
 
 def save_state(state: Dict[str, Any]):
     STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
-def check_budget_guard(estimated_cost_usd: float = AVG_CALL_COST_USD) -> Tuple[bool, str]:
+def reserve_budget(estimated_usd: float = AVG_CALL_COST_USD) -> Tuple[bool, str]:
     """
-    CRITICAL BUDGET GUARD:
-    Verifies that monthly LLM spend does not exceed the $5.00 cap.
+    Atomically reserves budget in state.json BEFORE making any external LLM call (Fix 4).
+    Fails closed if state is corrupt or budget exceeded.
     """
-    state = load_state()
-    current_spend = state.get("llm_spend_this_month", 0.0)
-    budget_cap = state.get("monthly_budget_cap", DEFAULT_BUDGET_CAP)
-    
-    if current_spend + estimated_cost_usd > budget_cap:
-        reason = (f"[BUDGET_GUARD BLOCKED] Monthly budget exceeded: "
-                  f"${current_spend:.4f} + ${estimated_cost_usd:.4f} > ${budget_cap:.2f} cap. "
-                  f"Aborting call to protect operating margin.")
-        return False, reason
+    with file_lock(STATE_LOCK_FILE):
+        state = load_state()
+        current_spend = state.get("llm_spend_this_month", 0.0)
+        budget_cap = state.get("monthly_budget_cap", DEFAULT_BUDGET_CAP)
         
-    return True, f"Budget approved: ${current_spend:.4f} / ${budget_cap:.2f}"
+        if current_spend + estimated_usd > budget_cap:
+            return False, f"Budget exceeded: ${current_spend:.4f} + ${estimated_usd:.4f} > ${budget_cap:.2f} cap."
+            
+        # Atomically reserve the estimated spend upfront
+        state["llm_spend_this_month"] = round(current_spend + estimated_usd, 6)
+        save_state(state)
+        return True, f"Budget reserved: ${state['llm_spend_this_month']:.4f} / ${budget_cap:.2f}"
 
-def record_spend(actual_cost_usd: float):
-    state = load_state()
-    state["llm_spend_this_month"] = round(state.get("llm_spend_this_month", 0.0) + actual_cost_usd, 6)
-    save_state(state)
+def reconcile_budget(reserved_usd: float, actual_usd: float):
+    """Adjusts spend ledger if actual token consumption differs from estimate."""
+    with file_lock(STATE_LOCK_FILE):
+        state = load_state()
+        diff = actual_usd - reserved_usd
+        state["llm_spend_this_month"] = round(state.get("llm_spend_this_month", 0.0) + diff, 6)
+        save_state(state)
+
+def release_budget_reservation(reserved_usd: float):
+    """Releases reserved funds if the LLM call failed or was rejected."""
+    with file_lock(STATE_LOCK_FILE):
+        state = load_state()
+        state["llm_spend_this_month"] = max(0.0, round(state.get("llm_spend_this_month", 0.0) - reserved_usd, 6))
+        save_state(state)
 
 def clone_repository(repo_name: str, target_dir: Path) -> bool:
-    """Performs a shallow clone of the target repository."""
+    """Clones target repo safely with name validation, shallow flags, and no prompts (Fix 15)."""
+    if not REPO_RE.match(repo_name):
+        print(f"[SOLVER ERROR] Rejected unsafe repo name format: {repo_name}")
+        return False
+
     repo_url = f"https://github.com/{repo_name}.git"
-    print(f"[SOLVER] Cloning repository {repo_name} (shallow depth=1)...")
+    print(f"[SOLVER] Cloning {repo_name} (depth=1, no-tags, single-branch)...")
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    
     try:
         res = subprocess.run(
-            ["git", "clone", "--depth", "1", repo_url, str(target_dir)],
+            ["git", "clone", "--depth", "1", "--filter=blob:none", "--no-tags", "--single-branch", repo_url, str(target_dir)],
             capture_output=True,
             text=True,
-            timeout=45
+            timeout=45,
+            env=env
         )
         if res.returncode == 0:
-            print(f"[SOLVER] Successfully cloned {repo_name} into {target_dir}")
+            print(f"[SOLVER] Cloned {repo_name} successfully.")
             return True
         else:
             print(f"[SOLVER] Clone failed: {res.stderr.strip()[:100]}")
             return False
     except Exception as e:
-        print(f"[SOLVER] Clone exception: {e}")
+        print(f"[SOLVER] Clone exception: {type(e).__name__}")
         return False
 
-def find_relevant_files(repo_path: Path, issue_title: str, issue_body: str) -> List[Path]:
-    """Scans the repository to identify files referenced in the issue."""
-    found_files = []
-    combined_text = f"{issue_title} {issue_body}"
+def is_protected_path(rel_path: str) -> bool:
+    """Checks if target file is on the sensitive files blacklist (Fix 16)."""
+    norm = rel_path.replace("\\", "/").lower()
+    return any(norm == p.lower() or norm.startswith(p.lower()) for p in PROTECTED_PATHS)
+
+def safe_target(repo_path: Path, candidate: Path) -> Optional[Path]:
+    """
+    Validates that candidate is inside repo_path, not a symlink, and <= 128KB (Fix 2, 14, 16).
+    """
+    if candidate.is_symlink():
+        print(f"[SECURITY] Rejected symlink: {candidate}")
+        return None
+        
+    try:
+        resolved = candidate.resolve()
+        repo_resolved = repo_path.resolve()
+        if not (resolved == repo_resolved or repo_resolved in resolved.parents):
+            print(f"[SECURITY] Path escape detected for {candidate}")
+            return None
+    except Exception:
+        return None
+
+    # Size cap check (Fix 2, 14)
+    try:
+        size = candidate.stat().st_size
+        if size > MAX_FILE_BYTES:
+            print(f"[SECURITY] File size exceeds 128KB cap ({size} bytes): {candidate}")
+            return None
+    except Exception:
+        return None
+
+    # Check blacklist
+    rel = candidate.relative_to(repo_path).as_posix()
+    if is_protected_path(rel):
+        print(f"[SECURITY] Rejected protected path: {rel}")
+        return None
+
+    return candidate
+
+def find_candidate_files(repo_path: Path, issue_title: str, issue_body: str) -> List[Path]:
+    """Locates and validates candidate source files referenced in issue context."""
+    found = []
+    combined = f"{issue_title} {issue_body}"
+    patterns = re.findall(r"[\w\-\/\\]+\.(?:py|md|js|ts|json|yml|yaml)\b", combined)
     
-    file_patterns = re.findall(r"[\w\-\/\\]+\.(?:py|md|js|ts|json|yml|yaml)\b", combined_text)
-    
-    for pat in file_patterns:
+    for pat in patterns:
         clean_pat = pat.replace("\\", "/").lstrip("/")
         candidate = repo_path / clean_pat
         if candidate.is_file():
-            found_files.append(candidate)
+            safe = safe_target(repo_path, candidate)
+            if safe and safe not in found:
+                found.append(safe)
         else:
             base_name = Path(clean_pat).name
-            matches = list(repo_path.glob(f"**/{base_name}"))
-            for m in matches:
-                if m.is_file() and m not in found_files:
-                    found_files.append(m)
+            for m in repo_path.glob(f"**/{base_name}"):
+                if m.is_file():
+                    safe = safe_target(repo_path, m)
+                    if safe and safe not in found:
+                        found.append(safe)
 
-    if not found_files:
+    # Fallback to general python/markdown source files
+    if not found:
         for ext in ["*.py", "*.md"]:
             for f in repo_path.glob(f"**/{ext}"):
                 if ".git" not in f.parts and f.is_file():
-                    found_files.append(f)
-                    if len(found_files) >= 2:
-                        break
-            if found_files:
+                    safe = safe_target(repo_path, f)
+                    if safe and safe not in found:
+                        found.append(safe)
+                        if len(found) >= 2:
+                            break
+            if found:
                 break
                 
-    return found_files[:3]
+    return found[:2]
 
-def call_openai_api(api_key: str, prompt: str) -> Optional[str]:
+def call_openai_api(api_key: str, prompt: str) -> Tuple[Optional[str], Optional[float]]:
     url = "https://api.openai.com/v1/chat/completions"
     headers = {
         "Content-Type": "application/json",
@@ -152,11 +259,10 @@ def call_openai_api(api_key: str, prompt: str) -> Optional[str]:
             {
                 "role": "system",
                 "content": (
-                    "You are an expert autonomous software engineer fixing a real open-source bug. "
-                    "Analyze the provided file content and issue description. "
-                    "Return ONLY a clean, valid unified diff patch that fixes the bug. "
+                    "You are an automated expert software engineer fixing an open-source bug. "
+                    "Return ONLY a clean, valid unified diff patch modifying the single specified file. "
                     "The diff MUST start with '--- a/' and '+++ b/'. "
-                    "Do NOT wrap in markdown quotes or backticks. Return raw diff only."
+                    "Do NOT wrap in markdown fences or quotes. No explanations. Raw diff only."
                 )
             },
             {"role": "user", "content": prompt}
@@ -168,26 +274,39 @@ def call_openai_api(api_key: str, prompt: str) -> Optional[str]:
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            content = data["choices"][0]["message"]["content"]
-            return content.strip()
+            choice = data["choices"][0]
+            # Fix 14: Check finish reason for token truncation
+            if choice.get("finish_reason") == "length":
+                print("[SOLVER ERROR] LLM response truncated due to max_tokens limit.")
+                return None, None
+            content = choice["message"]["content"]
+            # Estimate actual cost from token usage
+            usage = data.get("usage", {})
+            prompt_tokens = usage.get("prompt_tokens", 500)
+            comp_tokens = usage.get("completion_tokens", 300)
+            actual_cost = (prompt_tokens * 0.00000015) + (comp_tokens * 0.00000060)
+            return content.strip(), actual_cost
     except Exception as e:
-        print(f"[SOLVER LLM] OpenAI API call failed: {e}")
-        return None
+        print(f"[SOLVER LLM ERROR] OpenAI call failed: {type(e).__name__}")
+        return None, None
 
-def call_gemini_api(api_key: str, prompt: str) -> Optional[str]:
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
-    headers = {"Content-Type": "application/json"}
+def call_gemini_api(api_key: str, prompt: str) -> Tuple[Optional[str], Optional[float]]:
+    """Calls Gemini API passing the key in HTTP header, never in query string (Fix 12)."""
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": api_key
+    }
     payload = {
         "contents": [
             {
                 "parts": [
                     {
                         "text": (
-                            "You are an expert autonomous software engineer fixing a real open-source bug. "
-                            "Analyze the provided file content and issue description. "
-                            "Return ONLY a clean, valid unified diff patch that fixes the bug. "
+                            "You are an automated expert software engineer fixing an open-source bug. "
+                            "Return ONLY a clean, valid unified diff patch modifying the single specified file. "
                             "The diff MUST start with '--- a/' and '+++ b/'. "
-                            "Do NOT wrap in markdown quotes or backticks. Return raw diff only.\n\n"
+                            "Do NOT wrap in markdown fences or quotes. No explanations. Raw diff only.\n\n"
                             + prompt
                         )
                     }
@@ -199,226 +318,205 @@ def call_gemini_api(api_key: str, prompt: str) -> Optional[str]:
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            content = data["candidates"][0]["content"]["parts"][0]["text"]
-            return content.strip()
+            candidate = data["candidates"][0]
+            # Fix 14: Check finish reason
+            if candidate.get("finishReason") in ("MAX_TOKENS", "LENGTH"):
+                print("[SOLVER ERROR] Gemini response truncated due to token limit.")
+                return None, None
+            content = candidate["content"]["parts"][0]["text"]
+            return content.strip(), AVG_CALL_COST_USD
     except Exception as e:
-        print(f"[SOLVER LLM] Gemini API call failed: {e}")
-        return None
+        print(f"[SOLVER LLM ERROR] Gemini call failed: {type(e).__name__}")
+        return None, None
 
-def extract_unified_diff(raw_text: str, rel_path: str) -> str:
-    """Extracts raw unified diff from text and strips any enclosing markdown."""
+def extract_unified_diff(raw_text: str, rel_path: str) -> Optional[str]:
+    """
+    Strictly extracts a single-file unified diff matching rel_path with valid hunk headers (Fix 3).
+    Rejects garbage or multi-file diffs.
+    """
     clean = raw_text.strip()
-    # Strip markdown code blocks if present
     if clean.startswith("```"):
         clean = re.sub(r"^```(?:diff)?\n?", "", clean)
         clean = re.sub(r"\n?```$", "", clean)
         clean = clean.strip()
-        
-    if "--- a/" in clean and "+++ b/" in clean:
-        diff_start = clean.find("--- a/")
-        return clean[diff_start:].strip()
 
-    # Fallback structure if LLM omitted header
-    return f"--- a/{rel_path}\n+++ b/{rel_path}\n{clean}"
-
-def synthesize_semantic_code_fix(rel_path: str, original_code: str, issue: Dict[str, Any]) -> str:
-    """
-    Synthesizes an actual code change when no external LLM API key is present.
-    Performs real structural modifications (defensive validation, null-guards, imports).
-    """
-    lines = original_code.splitlines()
-    issue_num = issue.get("issue_number", 0)
-    issue_title = issue.get("title", "Fix")
-
-    # If python file, find first function definition and inject defensive validation
-    if rel_path.endswith(".py") and any(line.strip().startswith("def ") for line in lines):
-        new_lines = []
-        injected = False
-        target_line_idx = 0
-        
-        for i, line in enumerate(lines):
-            new_lines.append(line)
-            if not injected and line.strip().startswith("def ") and line.strip().endswith(":"):
-                indent = "    " + (len(line) - len(line.lstrip())) * " "
-                # Inject real code change: parameter validation and type-guard
-                new_lines.append(f"{indent}# Defensive validation for #{issue_num}: {issue_title[:40]}")
-                new_lines.append(f"{indent}if not locals():")
-                new_lines.append(f"{indent}    raise ValueError('Invalid arguments: payload cannot be empty')")
-                injected = True
-                target_line_idx = i + 1
-
-        if injected:
-            orig_slice = "\n".join(lines[max(0, target_line_idx - 1):target_line_idx + 2])
-            patch_slice = "\n".join(new_lines[max(0, target_line_idx - 1):target_line_idx + 5])
-            return f"""--- a/{rel_path}
-+++ b/{rel_path}
-@@ -{target_line_idx},3 +{target_line_idx},6 @@
- {line}
-+    # Defensive validation for #{issue_num}: {issue_title[:40]}
-+    if not locals():
-+        raise ValueError('Invalid arguments: payload cannot be empty')
-"""
-
-    # If markdown file, fix formatting or add documentation section
-    if rel_path.endswith(".md"):
-        return f"""--- a/{rel_path}
-+++ b/{rel_path}
-@@ -1,3 +1,7 @@
-+# Resolution for #{issue_num}: {issue_title}
-+
-+This module has been audited and updated to address issue #{issue_num}.
-+
-"""
-
-    # Generic code fix
-    return f"""--- a/{rel_path}
-+++ b/{rel_path}
-@@ -1,3 +1,7 @@
-+# Verified fix for #{issue_num}: {issue_title}
-+__version__ = "1.0.1"
-+
-"""
-
-def generate_contextual_patch(repo_path: Path, target_file: Path, issue: Dict[str, Any]) -> Tuple[str, bool]:
-    """
-    Reads target file, sends full context to LLM API (if key available),
-    or executes semantic code transformation. Returns (patch_content, is_llm_generated).
-    """
-    rel_path = target_file.relative_to(repo_path).as_posix()
-    try:
-        original_content = target_file.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        original_content = ""
-
-    # Truncate file content to reasonable token budget (max 250 lines)
-    lines = original_content.splitlines()
-    truncated_content = "\n".join(lines[:250])
+    header_a = f"--- a/{rel_path}"
+    header_b = f"+++ b/{rel_path}"
     
-    prompt = (
-        f"Target Repository File: {rel_path}\n\n"
-        f"Issue Title: {issue.get('title')}\n"
-        f"Issue Description:\n{issue.get('full_body', '')}\n\n"
-        f"Current File Content:\n```\n{truncated_content}\n```\n\n"
-        f"Task: Generate a valid unified diff (.patch) that modifies `{rel_path}` to fix this issue. "
-        f"Provide real, functional code changes. Return ONLY the unified diff starting with '--- a/{rel_path}'."
-    )
+    if header_a not in clean or header_b not in clean:
+        # Check if generic header was provided
+        if "--- a/" in clean and "+++ b/" in clean:
+            lines = clean.splitlines()
+            new_lines = []
+            for line in lines:
+                if line.startswith("--- a/"):
+                    new_lines.append(header_a)
+                elif line.startswith("+++ b/"):
+                    new_lines.append(header_b)
+                else:
+                    new_lines.append(line)
+            clean = "\n".join(new_lines)
+        else:
+            return None
 
-    keys = load_env_keys()
-    raw_patch = None
-    is_llm = False
+    # Ensure hunk header exists
+    lines = clean.splitlines()
+    has_hunk = any(HUNK_HEADER_RE.match(line) for line in lines)
+    if not has_hunk:
+        return None
 
-    # 1. Try OpenAI if key is present
-    openai_key = keys.get("OPENAI_API_KEY")
-    if openai_key and not openai_key.startswith("sk_test_") and not "YOUR" in openai_key:
-        print("[SOLVER] Calling OpenAI gpt-4o-mini API...")
-        raw_patch = call_openai_api(openai_key, prompt)
-        if raw_patch:
-            is_llm = True
+    # Check for multi-file attempt (only one '--- a/' allowed)
+    if clean.count("--- a/") > 1:
+        return None
 
-    # 2. Try Gemini if OpenAI not used
-    gemini_key = keys.get("GEMINI_API_KEY")
-    if not raw_patch and gemini_key and not "YOUR" in gemini_key:
-        print("[SOLVER] Calling Google Gemini API...")
-        raw_patch = call_gemini_api(gemini_key, prompt)
-        if raw_patch:
-            is_llm = True
+    start_idx = clean.find(header_a)
+    return clean[start_idx:].strip()
 
-    # 3. Fallback to semantic code repair if no external API key is active
-    if not raw_patch:
-        print("[SOLVER] Generating semantic code repair (defensive validation and parameter bounds)...")
-        raw_patch = synthesize_semantic_code_fix(rel_path, original_content, issue)
-
-    clean_diff = extract_unified_diff(raw_patch, rel_path)
-    return clean_diff, is_llm
+def validate_patch(repo_path: Path, patch_text: str) -> bool:
+    """
+    Writes patch to .tp_validate.patch and executes `git apply --check --ignore-whitespace` (Fix 3).
+    Cleans up temporary file and returns True only if returncode == 0.
+    """
+    validate_file = repo_path / ".tp_validate.patch"
+    try:
+        validate_file.write_text(patch_text, encoding="utf-8")
+        res = subprocess.run(
+            ["git", "apply", "--check", "--ignore-whitespace", ".tp_validate.patch"],
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        return res.returncode == 0
+    except Exception as e:
+        print(f"[VALIDATION ERROR] Exception running git apply: {type(e).__name__}")
+        return False
+    finally:
+        if validate_file.exists():
+            try:
+                validate_file.unlink()
+            except Exception:
+                pass
 
 def solve_issue(issue: Dict[str, Any], dry_run: bool = True) -> Optional[Dict[str, Any]]:
     """
-    Clones the target repo, reads actual files, checks budget guard,
-    invokes LLM or code synthesis, and generates a validated patch file.
+    Clones repo, safely resolves files, checks/reserves budget atomically,
+    calls LLM, validates patch with `git apply --check`, and outputs patch.
+    Zero synthetic fallbacks: returns None on failure (Fix 3, 4, 11).
     """
     issue_id = str(issue.get("id"))
     repo_name = issue.get("repo")
     issue_num = issue.get("issue_number")
-    state = load_state()
-    
-    if issue_id in state.get("processed_issue_ids", []):
-        print(f"[SOLVER] Issue {repo_name}#{issue_num} already processed. Skipping.")
-        return None
-        
-    allowed, status_msg = check_budget_guard(AVG_CALL_COST_USD)
-    if not allowed:
-        print(status_msg)
-        return None
-        
-    print(f"[SOLVER] Analyzing bounty on {repo_name}#{issue_num}: ${issue.get('bounty_amount'):.2f}")
-    print(f"[SOLVER] {status_msg}")
-    
-    with tempfile.TemporaryDirectory() as temp_dir_str:
-        temp_dir = Path(temp_dir_str)
-        clone_success = clone_repository(repo_name, temp_dir)
-        
-        if not clone_success:
-            print(f"[SOLVER WARNING] Could not clone {repo_name}. Skipping to next candidate.")
-            return None
-            
-        relevant_files = find_relevant_files(temp_dir, issue.get("title", ""), issue.get("full_body", ""))
-        if not relevant_files:
-            print(f"[SOLVER WARNING] No accessible source files found in {repo_name}. Skipping.")
-            return None
-            
-        target_file = relevant_files[0]
-        rel_target = target_file.relative_to(temp_dir).as_posix()
-        print(f"[SOLVER] Target file identified: {rel_target}")
-        
-        patch_text, is_llm = generate_contextual_patch(temp_dir, target_file, issue)
-        
-    # Deduct spend and save state
-    record_spend(AVG_CALL_COST_USD)
-    
-    PATCHES_DIR.mkdir(parents=True, exist_ok=True)
-    patch_filename = f"bounty_{issue_num}_{issue_id}.patch"
-    patch_path = PATCHES_DIR / patch_filename
-    patch_path.write_text(patch_text, encoding="utf-8")
-    
-    state = load_state()
-    processed = state.get("processed_issue_ids", [])
-    if issue_id not in processed:
-        processed.append(issue_id)
-    state["processed_issue_ids"] = processed
-    state["bounties_solved"] = state.get("bounties_solved", 0) + 1
-    save_state(state)
-    
-    result = {
-        "issue_id": issue_id,
-        "repo": repo_name,
-        "issue_number": issue_num,
-        "bounty_amount": issue.get("bounty_amount"),
-        "patch_file": str(patch_path),
-        "patch_content": patch_text,
-        "is_llm": is_llm,
-        "pr_title": f"fix: resolve {issue.get('title')} (#{issue_num})",
-        "pr_body": (
-            f"Fixes #{issue_num}\n\n"
-            f"Automated code fix generated by TenderPulse Bounty Hunter.\n"
-            f"- Bounty: ${issue.get('bounty_amount'):.2f}\n"
-            f"- File modified: `{rel_target}`\n"
-            f"- Engine: {'LLM (gpt-4o-mini/gemini)' if is_llm else 'Contextual Code Fix'}\n"
-            f"- Unified diff validated."
-        )
-    }
-    print(f"[SOLVER] Real patch generated and saved to {patch_path}")
-    return result
+    claim_url = issue.get("claim_url", "https://algora.io")
+    platform = issue.get("platform", "Bounty Platform")
 
-if __name__ == "__main__":
-    sample = {
-        "id": "sample_101",
-        "repo": "pallets/click",
-        "issue_number": 999,
-        "title": "Fix unhandled NoneType in CLI args parsing",
-        "full_body": "When args is None, parse() throws AttributeError. Should guard against None.",
-        "bounty_amount": 50.0
-    }
-    res = solve_issue(sample, dry_run=True)
-    if res:
-        print("\nGenerated Patch Content:")
-        print(res["patch_content"])
+    # In dry-run mode, we do NOT mutate state.json or deduct budget (Fix 11)
+    reserved = False
+    if not dry_run:
+        allowed, msg = reserve_budget(AVG_CALL_COST_USD)
+        if not allowed:
+            print(f"[SOLVER BLOCKED] {msg}")
+            return None
+        reserved = True
+        print(f"[SOLVER BUDGET] {msg}")
+
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir_str:
+            temp_dir = Path(temp_dir_str)
+            if not clone_repository(repo_name, temp_dir):
+                if reserved:
+                    release_budget_reservation(AVG_CALL_COST_USD)
+                return None
+
+            candidates = find_candidate_files(temp_dir, issue.get("title", ""), issue.get("full_body", ""))
+            if not candidates:
+                print(f"[SOLVER] No accessible, safe source files in {repo_name}.")
+                if reserved:
+                    release_budget_reservation(AVG_CALL_COST_USD)
+                return None
+
+            target_file = candidates[0]
+            rel_target = target_file.relative_to(temp_dir).as_posix()
+            print(f"[SOLVER] Target file selected: {rel_target}")
+
+            # Read file bytes up to 128KB cap (Fix 14)
+            file_bytes = target_file.read_bytes()[:MAX_FILE_BYTES]
+            file_content = file_bytes.decode("utf-8", errors="ignore")
+
+            # Wrap untrusted inputs in security tags (Fix 16)
+            prompt = (
+                f"Target File: {rel_target}\n\n"
+                f"<untrusted_issue>\n"
+                f"Title: {issue.get('title')}\n"
+                f"Body: {issue.get('full_body', '')}\n"
+                f"</untrusted_issue>\n\n"
+                f"Original File Content:\n```\n{file_content}\n```\n\n"
+                f"Task: Output a raw unified diff patch modifying `{rel_target}` that cleanly resolves the issue. "
+                f"Do not modify any other file. Start strictly with '--- a/{rel_target}'."
+            )
+
+            keys = load_env_keys()
+            raw_patch = None
+            actual_cost = None
+
+            # Try OpenAI
+            openai_key = keys.get("OPENAI_API_KEY")
+            if openai_key and not openai_key.startswith("sk_test_") and "YOUR" not in openai_key:
+                raw_patch, actual_cost = call_openai_api(openai_key, prompt)
+
+            # Try Gemini
+            if not raw_patch:
+                gemini_key = keys.get("GEMINI_API_KEY")
+                if gemini_key and "YOUR" not in gemini_key:
+                    raw_patch, actual_cost = call_gemini_api(gemini_key, prompt)
+
+            # Fix 3: No fake semantic code fallback! If LLM failed, return None
+            if not raw_patch:
+                print(f"[SOLVER] LLM inference unavailable or returned no output. Skipping {repo_name}#{issue_num}.")
+                if reserved:
+                    release_budget_reservation(AVG_CALL_COST_USD)
+                return None
+
+            # Reconcile actual spend (Fix 4)
+            if reserved and actual_cost is not None:
+                reconcile_budget(AVG_CALL_COST_USD, actual_cost)
+
+            # Extract clean unified diff
+            clean_patch = extract_unified_diff(raw_patch, rel_target)
+            if not clean_patch:
+                print(f"[SOLVER ERROR] Could not extract valid unified diff format for {rel_target}.")
+                return None
+
+            # Validate patch with git apply --check (Fix 3)
+            if not validate_patch(temp_dir, clean_patch):
+                print(f"[SOLVER ERROR] Patch failed `git apply --check` against {rel_target}. Discarding.")
+                return None
+
+            print(f"[SOLVER SUCCESS] Patch passed `git apply --check` for {rel_target}!")
+
+            # Fix 7: Log manual claim instruction
+            print(f"[PAYOUT] Manual claim required for {platform}: {claim_url}")
+
+            # Save patch
+            out_dir = DRY_RUN_PATCHES_DIR if dry_run else PATCHES_DIR
+            out_dir.mkdir(parents=True, exist_ok=True)
+            patch_file = out_dir / f"bounty_{issue_num}_{issue_id}.patch"
+            patch_file.write_text(clean_patch, encoding="utf-8")
+
+            return {
+                "issue_id": issue_id,
+                "repo": repo_name,
+                "issue_number": issue_num,
+                "bounty_amount": issue.get("bounty_amount"),
+                "claim_url": claim_url,
+                "platform": platform,
+                "patch_file": str(patch_file),
+                "patch_content": clean_patch,
+                "target_file": rel_target
+            }
+
+    except Exception as e:
+        print(f"[SOLVER UNHANDLED ERROR] {type(e).__name__}: {e}")
+        if reserved:
+            release_budget_reservation(AVG_CALL_COST_USD)
+        return None

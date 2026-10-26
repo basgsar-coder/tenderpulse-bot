@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Pre-commit Secret Guard
-Scans staged or tracked files for prohibited secrets or private key patterns.
-Fails with exit code 1 if any violation is detected.
+Pre-commit & CI Secret Guard
+Scans staged or all tracked files for high-entropy secrets and credential patterns.
+Never prints matched secrets to stdout/logs to prevent secret exfiltration into CI records.
 """
 
 import sys
@@ -10,12 +10,16 @@ import os
 import re
 import subprocess
 from pathlib import Path
+from typing import List, Tuple
 
-# Prohibited patterns constructed without literal trigger strings
-PROHIBITED_PATTERNS = [
-    (re.compile(r"EVM_" + r"PRIVATE_KEY"), "EVM private key reference"),
-    (re.compile(r"STRIPE_" + r"SECRET_KEY"), "Stripe secret key reference"),
-    (re.compile(r"-----BEGIN .* PRIVATE KEY-----"), "PEM formatted private key"),
+PROHIBITED_RULES: List[Tuple[re.Pattern, str]] = [
+    (re.compile(r"ghp_[A-Za-z0-9_]{36,}"), "GitHub Personal Access Token (Classic)"),
+    (re.compile(r"github_pat_[A-Za-z0-9_]{82,}"), "GitHub Fine-Grained Personal Access Token"),
+    (re.compile(r"sk-[A-Za-z0-9_-]{20,}"), "OpenAI Secret Key"),
+    (re.compile(r"AIza[0-9A-Za-z_-]{35}"), "Google Cloud / Gemini API Key"),
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "AWS Access Key ID"),
+    (re.compile(r"0x[a-fA-F0-9]{64}"), "Raw 64-hex Private Key"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"), "PEM-formatted Private Key Header"),
 ]
 
 EXCLUDED_FILES = {
@@ -23,40 +27,59 @@ EXCLUDED_FILES = {
     "tests/test_secret_guard.py"
 }
 
-def scan_content(content: str, filename: str = "") -> list:
+def scan_content(content: str, filename: str = "") -> List[str]:
     violations = []
-    # Normalize path separators
-    normalized_name = filename.replace("\\", "/")
+    norm_name = filename.replace("\\", "/")
     for excluded in EXCLUDED_FILES:
-        if normalized_name.endswith(excluded):
+        if norm_name.endswith(excluded):
             return []
 
-    for pattern, desc in PROHIBITED_PATTERNS:
-        matches = pattern.findall(content)
-        if matches:
-            violations.append(f"{desc} (matched '{matches[0]}') in {filename}")
+    for pattern, rule_name in PROHIBITED_RULES:
+        if pattern.search(content):
+            # Report rule name and file path ONLY - NEVER echo the secret string
+            violations.append(f"[{rule_name}] in {filename}")
     return violations
 
-def get_staged_files():
+def get_target_files(args: List[str]) -> List[str]:
+    if args:
+        return args
+        
+    # Check staged files first (pre-commit hook mode)
     try:
         res = subprocess.run(
             ["git", "diff", "--cached", "--name-only", "--diff-filter=ACM"],
             capture_output=True, text=True, check=True
         )
-        return [f.strip() for f in res.stdout.splitlines() if f.strip()]
+        staged = [f.strip() for f in res.stdout.splitlines() if f.strip()]
+        if staged:
+            return staged
     except Exception:
-        return []
+        pass
+        
+    # Fallback: scan all tracked files via git ls-files (CI mode)
+    try:
+        res = subprocess.run(
+            ["git", "ls-files"],
+            capture_output=True, text=True, check=True
+        )
+        tracked = [f.strip() for f in res.stdout.splitlines() if f.strip()]
+        if tracked:
+            return tracked
+    except Exception:
+        pass
+
+    # Filesystem fallback
+    target_files = []
+    base = Path.cwd()
+    for p in base.rglob("*"):
+        if p.is_file() and ".git" not in p.parts and not p.name.endswith(".db"):
+            target_files.append(str(p.relative_to(base)))
+    return target_files
 
 def main():
-    target_files = sys.argv[1:]
-    if not target_files:
-        target_files = get_staged_files()
-        
-    if not target_files:
-        # If no specific files passed and no staged files, exit clean
-        return 0
-
+    target_files = get_target_files(sys.argv[1:])
     total_violations = []
+
     for filepath in target_files:
         p = Path(filepath)
         if not p.is_file():
@@ -66,15 +89,15 @@ def main():
             violations = scan_content(content, str(filepath))
             total_violations.extend(violations)
         except Exception as e:
-            print(f"[SECRET_GUARD] Warning: Could not read {filepath}: {e}")
+            print(f"[SECRET_GUARD] Warning: Could not read {filepath}: {type(e).__name__}")
 
     if total_violations:
         print("\n" + "=" * 60)
-        print("[BLOCKED] COMMIT REJECTED BY PRE-COMMIT SECRET GUARD")
-        print("Prohibited secrets or private key patterns detected:")
+        print("[BLOCKED] SECRET GUARD DETECTED CREDENTIALS IN TRACKED FILES")
+        print("Violation summary (sensitive contents suppressed for safety):")
         for v in total_violations:
             print(f"  - {v}")
-        print("Action required: Remove the secret from tracked files and add it to .env (which must be in .gitignore).")
+        print("Action required: Remove the secret immediately and place it in .env.")
         print("=" * 60 + "\n")
         sys.exit(1)
 

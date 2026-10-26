@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-Unit tests for the TenderPulse GitHub Bounty Scanner
-Tests price regex extraction, capability filtering, and GitHub REST API parsing with mocked HTTP responses.
+Unit tests for the TenderPulse Verified Bounty Scanner
+Asserts that:
+1. Payout platforms (Algora & IssueHunt) are strictly required and parsed.
+2. Spam repositories are blocked by normalized regex.
+3. HTTP 403/429 and rate-exhaustion headers raise RateLimited exceptions.
 """
 
 import unittest
@@ -9,6 +12,7 @@ import sys
 import json
 import sqlite3
 import tempfile
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -17,7 +21,7 @@ sys.path.insert(0, str(BASE_DIR))
 
 import bounty_scanner
 
-class TestBountyScanner(unittest.TestCase):
+class TestVerifiedBountyScanner(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.temp_db_file = Path(self.temp_dir.name) / "test_bounties.db"
@@ -28,90 +32,107 @@ class TestBountyScanner(unittest.TestCase):
         bounty_scanner.DB_FILE = self.orig_db_file
         self.temp_dir.cleanup()
 
-    def test_extract_bounty_amount(self):
-        cases = [
-            ("Bug bounty: $150.00 for fixing this memory leak", 150.0),
-            ("Algora $50 bounty on this issue", 50.0),
-            ("Offering $250 to whoever submits a clean PR", 250.0),
-            ("100 USDC reward for documentation fix", 100.0),
-            ("No price mentioned here", 0.0),
+    def test_detect_platform_algora_and_issuehunt(self):
+        # 1. Valid Algora bounty text
+        algora_text = (
+            "Please fix this memory bug.\n"
+            "Bounty: $150.00\n"
+            "Claim bounty on Algora: https://console.algora.io/bounties/bnty_12345abc"
+        )
+        detected = bounty_scanner.detect_platform(algora_text)
+        self.assertIsNotNone(detected)
+        self.assertEqual(detected[0], "Algora")
+        self.assertEqual(detected[1], 150.0)
+        self.assertEqual(detected[2], "https://console.algora.io/bounties/bnty_12345abc")
+
+        # 2. Valid IssueHunt bounty text
+        issuehunt_text = (
+            "Reward offered for this task!\n"
+            "Funded with $100 bounty on IssueHunt:\n"
+            "https://issuehunt.io/r/facebook/react/issues/456"
+        )
+        detected_ih = bounty_scanner.detect_platform(issuehunt_text)
+        self.assertIsNotNone(detected_ih)
+        self.assertEqual(detected_ih[0], "IssueHunt")
+        self.assertEqual(detected_ih[1], 100.0)
+        self.assertEqual(detected_ih[2], "https://issuehunt.io/r/facebook/react/issues/456")
+
+        # 3. Unverified bounty without recognized platform URL (MUST be rejected)
+        unverified_text = "I will pay $50 to anyone who fixes this via PayPal or cash"
+        detected_none = bounty_scanner.detect_platform(unverified_text)
+        self.assertIsNone(detected_none, "Bounties lacking recognized escrow URLs must be rejected")
+
+    def test_spam_repo_normalized_regex(self):
+        spam_cases = [
+            "zhangjiayang6835-cyber/bounty-plaza",
+            "Rohank143/BountyScout",
+            "bot-user/bounty.alert",
+            "org/bounty_bot_v2",
+            "scammer/free-airdrop",
+            "crypto/faucet-collector",
         ]
-        for text, expected in cases:
-            extracted = bounty_scanner.extract_bounty_amount(text)
-            self.assertEqual(extracted, expected, f"Failed on text: '{text}'")
+        for name in spam_cases:
+            self.assertTrue(bounty_scanner.is_spam_repo(name), f"Failed to block spam repo: {name}")
 
-    def test_matches_capabilities(self):
-        self.assertTrue(bounty_scanner.matches_capabilities(
-            "Fix Python CLI argument parser", "Fails on boolean flags", ["bug"]
-        ))
-        self.assertTrue(bounty_scanner.matches_capabilities(
-            "Update API documentation", "Markdown syntax cleanup", ["docs"]
-        ))
-        self.assertFalse(bounty_scanner.matches_capabilities(
-            "Design vector graphic logo", "Need SVG icon for website", ["design", "art"]
-        ))
-
-    def test_spam_filtering(self):
-        self.assertTrue(bounty_scanner.is_spam_or_blocked("zhangjiayang6835-cyber/bounty-plaza"))
-        self.assertTrue(bounty_scanner.is_spam_or_blocked("Rohank143/BountyScout"))
-        self.assertTrue(bounty_scanner.is_spam_or_blocked("some-user/crypto-faucet-bot"))
-        self.assertFalse(bounty_scanner.is_spam_or_blocked("pallets/click"))
-        self.assertFalse(bounty_scanner.is_spam_or_blocked("psf/requests"))
+        legit_cases = [
+            "pallets/click",
+            "psf/requests",
+            "tiangolo/fastapi",
+            "facebook/react",
+            "bounty-hunter-legit-tool/useful-lib"  # Not matching spam suffix/pattern
+        ]
+        for name in legit_cases:
+            self.assertFalse(bounty_scanner.is_spam_repo(name), f"Incorrectly blocked legit repo: {name}")
 
     @patch("urllib.request.urlopen")
-    def test_search_github_bounties_with_mock_response(self, mock_urlopen):
-        mock_response_data = {
-            "total_count": 1,
+    def test_rate_limited_exception_raised_on_403_or_429(self, mock_urlopen):
+        # Simulate GitHub 403 rate limit response
+        headers = {"X-RateLimit-Reset": "1730000000", "Retry-After": "60"}
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            url="https://api.github.com/search/issues",
+            code=403,
+            msg="rate limit exceeded",
+            hdrs=headers,
+            fp=None
+        )
+
+        with self.assertRaises(bounty_scanner.RateLimited):
+            bounty_scanner.search_github_bounties("test query", token="test_token")
+
+    @patch("urllib.request.urlopen")
+    def test_search_github_bounties_filters_unverified(self, mock_urlopen):
+        mock_response = {
+            "total_count": 2,
             "items": [
                 {
-                    "id": 123456789,
-                    "number": 88,
-                    "title": "Fix Python regex parser memory leak ($100 bounty)",
-                    "body": "There is a memory leak in the token loop. Offering $100 bounty.",
-                    "html_url": "https://github.com/example-org/repo/issues/88",
-                    "repository_url": "https://api.github.com/repos/example-org/repo",
-                    "labels": [{"name": "bounty"}, {"name": "python"}, {"name": "bug"}]
+                    "id": 111,
+                    "number": 10,
+                    "title": "Legit Algora Bounty ($50)",
+                    "body": "Fix this bug https://console.algora.io/bounties/bnty_abc123 $50 bounty",
+                    "html_url": "https://github.com/legit-org/repo/issues/10",
+                    "repository_url": "https://api.github.com/repos/legit-org/repo",
+                    "labels": [{"name": "bounty"}]
+                },
+                {
+                    "id": 222,
+                    "number": 20,
+                    "title": "Scam Bounty without link",
+                    "body": "I will give $1000 for this",
+                    "html_url": "https://github.com/scam-org/repo/issues/20",
+                    "repository_url": "https://api.github.com/repos/scam-org/repo",
+                    "labels": [{"name": "bounty"}]
                 }
             ]
         }
         mock_resp = MagicMock()
-        mock_resp.read.return_value = json.dumps(mock_response_data).encode("utf-8")
+        mock_resp.read.return_value = json.dumps(mock_response).encode("utf-8")
+        mock_resp.headers = {"X-RateLimit-Remaining": "10"}
         mock_urlopen.return_value.__enter__.return_value = mock_resp
 
-        results = bounty_scanner.search_github_bounties("test query", token="test_token")
-        self.assertEqual(len(results), 1)
-        item = results[0]
-        self.assertEqual(item["repo"], "example-org/repo")
-        self.assertEqual(item["issue_number"], 88)
-        self.assertEqual(item["bounty_amount"], 100.0)
-
-    def test_persist_bounties_in_database(self):
-        sample_bounties = [
-            {
-                "id": "item_1",
-                "repo": "test/repo1",
-                "issue_number": 10,
-                "title": "Bounty issue 1",
-                "url": "https://github.com/test/repo1/issues/10",
-                "bounty_amount": 75.0,
-                "currency": "USD",
-                "labels": "bounty, python",
-                "body_preview": "Sample body preview"
-            }
-        ]
-        stored_count = bounty_scanner.persist_bounties(sample_bounties)
-        self.assertEqual(stored_count, 1)
-
-        # Verify record in SQLite
-        conn = sqlite3.connect(self.temp_db_file)
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, bounty_amount FROM bounties WHERE id = 'item_1'")
-        row = cursor.fetchone()
-        conn.close()
-
-        self.assertIsNotNone(row)
-        self.assertEqual(row[0], "item_1")
-        self.assertEqual(row[1], 75.0)
+        results = bounty_scanner.search_github_bounties("test", token="dummy")
+        self.assertEqual(len(results), 1, "Only verified Algora/IssueHunt bounties should be returned")
+        self.assertEqual(results[0]["id"], "111")
+        self.assertEqual(results[0]["platform"], "Algora")
 
 if __name__ == "__main__":
     unittest.main()

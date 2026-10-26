@@ -1,29 +1,28 @@
-# HUMAN_GATES.md: The Two Irreducible Cloud Gates
+# HUMAN_GATES.md: Red Team Hardened Cloud Deployment Gates
 
-## 1. Executive Summary
-The workflow operates as an autonomous **GitHub Bounty Hunter** that runs 24/7 in the cloud via GitHub Actions. It scans verified open-source repositories for bounties, clones the target repo, reads the real files, generates context-aware code patches using an LLM, and submits pull requests to claim payouts.
+## 1. Overview & Security Architecture
+TenderPulse is an automated 24/7 **GitHub Bounty Hunter** that discovers verified open-source bounties (Algora & IssueHunt), validates patches against target repositories via `git apply --check`, enforces strict monthly budget limits ($5.00), and posts resolution pull requests.
 
-To activate 24/7 autonomous cloud execution, exactly **TWO irreducible human gates** are required:
+To activate 24/7 cloud execution on GitHub Actions, the user must provide two secrets:
 
-| Gate | Name | Purpose | Active Time | Where Configured |
-| :--- | :--- | :--- | :--- | :--- |
-| **Gate 1** | **GitHub PAT & Remote Push** | Cloud hosting, Actions runner permissions & GitHub API quota | ~2 minutes | GitHub Repo + CLI push |
-| **Gate 2** | **LLM API Key** | AI code fix synthesis (Gemini or OpenAI) | ~1 minute | GitHub Actions Secrets |
+| Secret Name | Purpose | Scope / Source | Where to Configure |
+| :--- | :--- | :--- | :--- |
+| **`BOUNTY_BOT_TOKEN`** | Submit PRs and comments to external bounty repos | GitHub Classic PAT with `public_repo` scope | GitHub Repository Secrets |
+| **`GEMINI_API_KEY`** (or `OPENAI_API_KEY`) | LLM code patch synthesis engine | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) | GitHub Repository Secrets |
 
 ---
 
-## 2. Irreducible Gate 1: Remote Repository Linking & GitHub PAT
+## 2. Gate 1: Remote Repository Linking & BOUNTY_BOT_TOKEN
 
 ### Why It Cannot Be Automated:
-- GitHub account creation and remote repository provisioning require human authentication and anti-bot verification.
+- GitHub Actions default `GITHUB_TOKEN` is strictly scoped to the host repository; submitting comments or PRs to *third-party* open-source repositories requires an authenticated Personal Access Token (`BOUNTY_BOT_TOKEN`).
 
 ### Step-by-Step Instructions:
 
-#### Step 1: Create a Remote Repository
+#### Step 1: Create a Repository on GitHub
 1. Navigate to [github.com/new](https://github.com/new).
-2. Enter repository name: `tenderpulse-bounty-hunter`.
-3. Choose **Private** (recommended) or **Public**.
-4. Click **Create repository** (do not initialize with README or license).
+2. Enter repository name: `tenderpulse-bounty-hunter` (Private recommended).
+3. Click **Create repository**.
 
 #### Step 2: Push Local Code to GitHub
 Open a terminal in `c:\Users\Bensa\OneDrive\Desktop\DeepSeek OpenCode Harness\tenderpulse` and run:
@@ -33,39 +32,33 @@ git branch -M master
 git push -u origin master
 ```
 
-#### Step 3: Enable Actions Read & Write Permissions
-1. In your GitHub repository, go to **Settings** > **Actions** > **General**.
-2. Scroll to **Workflow permissions**.
-3. Select **Read and write permissions**.
-4. Check **Allow GitHub Actions to create and approve pull requests**.
-5. Click **Save**.
+#### Step 3: Generate & Add BOUNTY_BOT_TOKEN
+1. Navigate to [github.com/settings/tokens](https://github.com/settings/tokens) > **Generate new token (classic)**.
+2. Select scope: **`public_repo`** (Access public repositories).
+3. Generate and copy the token.
+4. In your GitHub repository, navigate to **Settings** > **Secrets and variables** > **Actions** > **New repository secret**.
+   - Name: `BOUNTY_BOT_TOKEN`
+   - Secret: Paste the token.
+   - Click **Add secret**.
 
 ---
 
-## 3. Irreducible Gate 2: LLM API Key (Gemini or OpenAI)
+## 3. Gate 2: LLM API Key (Gemini or OpenAI)
 
-### Why It Cannot Be Automated:
-- High-quality code patches require an advanced reasoning model. AI providers (Google AI Studio, OpenAI) require human developer registration and API key generation.
-
-### Step-by-Step Instructions:
-
-1. Obtain an API key from either provider:
-   - **Google Gemini (Recommended — Free Tier available):** [aistudio.google.com/apikey](https://aistudio.google.com/apikey)
+1. Obtain an API key:
+   - **Google Gemini (Free tier available):** [aistudio.google.com/apikey](https://aistudio.google.com/apikey)
    - **OpenAI:** [platform.openai.com/api-keys](https://platform.openai.com/api-keys)
-2. In your GitHub repository, navigate to **Settings** > **Secrets and variables** > **Actions**.
-3. Click **New repository secret**.
-4. Add your secret:
+2. In your GitHub repository, go to **Settings** > **Secrets and variables** > **Actions** > **New repository secret**:
    - Name: `GEMINI_API_KEY` (or `OPENAI_API_KEY`)
-   - Secret: Paste your actual API key
-5. Click **Add secret**.
-
-*(Optional for local testing)*: You can also paste this key into `tenderpulse/.env` as `GEMINI_API_KEY=...` or `OPENAI_API_KEY=...` to test real LLM patches locally before cloud runs.
+   - Secret: Paste your API key.
+   - Click **Add secret**.
 
 ---
 
-## 4. Operating Protections & Financial Thresholds
-- **24/7 Execution:** GitHub Actions runs live every 6 hours (`0 */6 * * *`).
-- **Operating Cost:** **$0.00 / month** on GitHub Actions free tier.
-- **Budget Guard:** Hard monthly spend limit of **$5.00** strictly enforced in code. If monthly spend hits $5.00, inference halts immediately until the next calendar month.
-- **Spam Guard:** Limited to **1 live PR per cycle**, targeting repositories with **$\ge 10$ stars**, and strictly blocking aggregator spam repos (`bounty-plaza`, `BountyScout`).
-- **Revenue Target:** Solving just 1 modest bounty per month ($25.00 to $150.00) nets **$\ge \$20.00 / \text{month}$**, completely fulfilling the Prime Directive.
+## 4. Operational Guardrails
+- **Execution Schedule:** Every 6 hours (`0 */6 * * *`).
+- **Timeout Protection:** 20-minute workflow execution cap.
+- **Concurrency Lock:** Cancels overlapping runner collisions.
+- **Budget Guard:** Hard monthly cap of **$5.00** strictly locked with file locking and fail-closed state validation.
+- **Submission Limits:** Maximum **3 submissions per day** and **7-day cooldown per repository**.
+- **Payout Notification:** Every solved bounty outputs a manual claim link: `[PAYOUT] Manual claim required for {platform}: {claim_url}`.
