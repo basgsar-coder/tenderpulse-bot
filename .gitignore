@@ -1,0 +1,21 @@
+# Secrets and Environment
+.env
+*.key
+state.json.bak
+*.pem
+
+# Token and Account Isolation (Cross-Project Guard)
+token_*.txt
+token*.txt
+accounts.json
+_legacy_bridge/
+
+# Databases and Logs
+tenderpulse.db
+*.log
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
