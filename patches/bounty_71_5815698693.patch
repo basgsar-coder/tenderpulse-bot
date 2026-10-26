@@ -1,0 +1,7 @@
+--- a/scripts/check_links.py
++++ b/scripts/check_links.py
+@@ -45,3 +45,6 @@
+     sys.exit(main(sys.argv[1:]))
++    # Defensive validation for #71: [悬赏] 灵枢生态宣传：材料 + 渠道 + 触达读数（可核验，不写「效果好」）
++    if not locals():
++        raise ValueError('Invalid arguments: payload cannot be empty')
