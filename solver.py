@@ -15,6 +15,7 @@ import sys
 import json
 import re
 import math
+import time
 import tempfile
 import subprocess
 import urllib.request
@@ -357,24 +358,39 @@ def call_openai_api(api_key: str, prompt: str) -> Tuple[Optional[str], Optional[
         "max_tokens": 1500
     }
     req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            choice = data["choices"][0]
-            # Fix 14: Check finish reason for token truncation
-            if choice.get("finish_reason") == "length":
-                print("[SOLVER ERROR] LLM response truncated due to max_tokens limit.")
-                return None, None
-            content = choice["message"]["content"]
-            # Estimate actual cost from token usage
-            usage = data.get("usage", {})
-            prompt_tokens = usage.get("prompt_tokens", 500)
-            comp_tokens = usage.get("completion_tokens", 300)
-            actual_cost = (prompt_tokens * 0.00000015) + (comp_tokens * 0.00000060)
-            return content.strip(), actual_cost
-    except Exception as e:
-        print(f"[SOLVER LLM ERROR] OpenAI call failed: {type(e).__name__}")
-        return None, None
+    for attempt in range(1, 4):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                choice = data["choices"][0]
+                # Fix 14: Check finish reason for token truncation
+                if choice.get("finish_reason") == "length":
+                    print("[SOLVER ERROR] LLM response truncated due to max_tokens limit.")
+                    return None, None
+                content = choice["message"]["content"]
+                # Estimate actual cost from token usage
+                usage = data.get("usage", {})
+                prompt_tokens = usage.get("prompt_tokens", 500)
+                comp_tokens = usage.get("completion_tokens", 300)
+                actual_cost = (prompt_tokens * 0.00000015) + (comp_tokens * 0.00000060)
+                return content.strip(), actual_cost
+        except urllib.error.HTTPError as e:
+            if e.code in (503, 429) and attempt < 3:
+                wait_time = 5 * attempt
+                print(f"[SOLVER LLM WARNING] OpenAI HTTP {e.code} on attempt {attempt}/3. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+            print(f"[SOLVER LLM ERROR] OpenAI HTTP {e.code}")
+            try:
+                error_body = e.read().decode('utf-8')
+                print(f"[SOLVER LLM ERROR] Body: {error_body}")
+            except Exception:
+                pass
+            return None, None
+        except Exception as e:
+            print(f"[SOLVER LLM ERROR] OpenAI call failed: {type(e).__name__}")
+            return None, None
+    return None, None
 
 def call_gemini_api(api_key: str, prompt: str) -> Tuple[Optional[str], Optional[float]]:
     """Calls Gemini API passing the key in HTTP header, never in query string (Fix 12)."""
@@ -401,27 +417,34 @@ def call_gemini_api(api_key: str, prompt: str) -> Tuple[Optional[str], Optional[
         ]
     }
     req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            candidate = data["candidates"][0]
-            # Fix 14: Check finish reason
-            if candidate.get("finishReason") in ("MAX_TOKENS", "LENGTH"):
-                print("[SOLVER ERROR] Gemini response truncated due to token limit.")
-                return None, None
-            content = candidate["content"]["parts"][0]["text"]
-            return content.strip(), AVG_CALL_COST_USD
-    except urllib.error.HTTPError as e:
-        print(f"[SOLVER LLM ERROR] Gemini HTTP {e.code}")
+    for attempt in range(1, 4):
         try:
-            error_body = e.read().decode('utf-8')
-            print(f"[SOLVER LLM ERROR] Body: {error_body}")
-        except Exception:
-            pass
-        return None, None
-    except Exception as e:
-        print(f"[SOLVER LLM ERROR] Gemini call failed: {type(e).__name__}")
-        return None, None
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                candidate = data["candidates"][0]
+                # Fix 14: Check finish reason
+                if candidate.get("finishReason") in ("MAX_TOKENS", "LENGTH"):
+                    print("[SOLVER ERROR] Gemini response truncated due to token limit.")
+                    return None, None
+                content = candidate["content"]["parts"][0]["text"]
+                return content.strip(), AVG_CALL_COST_USD
+        except urllib.error.HTTPError as e:
+            if e.code in (503, 429) and attempt < 3:
+                wait_time = 5 * attempt
+                print(f"[SOLVER LLM WARNING] Gemini HTTP {e.code} on attempt {attempt}/3. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+            print(f"[SOLVER LLM ERROR] Gemini HTTP {e.code}")
+            try:
+                error_body = e.read().decode('utf-8')
+                print(f"[SOLVER LLM ERROR] Body: {error_body}")
+            except Exception:
+                pass
+            return None, None
+        except Exception as e:
+            print(f"[SOLVER LLM ERROR] Gemini call failed: {type(e).__name__}")
+            return None, None
+    return None, None
 
 def extract_unified_diff(raw_text: str, rel_path: str) -> str:
     """
